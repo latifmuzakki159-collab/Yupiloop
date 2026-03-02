@@ -7,6 +7,7 @@ import SettingsModal from './components/SettingsModal';
 import CharacterCard from './components/CharacterCard';
 import ChatPage from './pages/ChatPage';
 import CharacterCreator from './pages/CharacterCreator';
+import BridgeManager from './components/BridgeManager';
 
 interface LayoutProps {
   onOpenSettings: () => void;
@@ -144,6 +145,7 @@ const App: React.FC = () => {
 
   return (
     <HashRouter>
+      <BridgeManager settings={settings} />
       <Layout onOpenSettings={() => setIsSettingsOpen(true)}>
         <Routes>
           <Route path="/" element={<HomePage characters={characters} setCharacters={setCharacters} />} />

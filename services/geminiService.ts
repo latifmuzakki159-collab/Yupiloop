@@ -120,15 +120,15 @@ const generateZhipuToken = async (apiKey: string): Promise<string> => {
 
 // --- GENERIC LLM REQUEST HANDLER ---
 // This function handles the actual API call logic for both Chat and Utility tasks
-const makeLLMRequest = async (
+export const makeLLMRequest = async (
     settings: AppSettings,
     messages: { role: string; content: string }[],
     systemInstruction?: string,
     jsonMode: boolean = false
 ): Promise<string> => {
     
-    // Check for OpenAI Compatible Providers (SumoPod / ElectronHub / GLM / BytePlus / NVIDIA)
-    if (['sumopod', 'electronhub', 'glm', 'byteplus', 'nvidia'].includes(settings.serviceProvider)) {
+    // Check for OpenAI Compatible Providers (SumoPod / ElectronHub / GLM / BytePlus / NVIDIA / Custom)
+    if (['sumopod', 'electronhub', 'glm', 'byteplus', 'nvidia', 'custom'].includes(settings.serviceProvider)) {
         
         let endpoint = "";
         let apiKey = "";
@@ -155,6 +155,10 @@ const makeLLMRequest = async (
             endpoint = "https://integrate.api.nvidia.com/v1/chat/completions";
             apiKey = settings.nvidiaApiKey;
             providerName = "NVIDIA";
+        } else if (settings.serviceProvider === 'custom') {
+            endpoint = settings.customEndpoint;
+            apiKey = settings.customApiKey;
+            providerName = "Custom Provider";
         }
         
         // SumoPod / ElectronHub / GLM / BytePlus / NVIDIA / OpenAI Format
@@ -214,13 +218,18 @@ const makeLLMRequest = async (
         }
 
         try {
+            const headers: any = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            };
+            
+            if (apiKey) {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+            }
+
             const response = await fetch(endpoint, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json', // Important for some strict APIs
-                    'Authorization': `Bearer ${apiKey}`
-                },
+                headers: headers,
                 body: JSON.stringify(payload),
                 mode: 'cors'
             });

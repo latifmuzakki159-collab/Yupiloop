@@ -36,11 +36,13 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
               fetchModels('byteplus');
           } else if (localSettings.serviceProvider === 'nvidia') {
               fetchModels('nvidia');
+          } else if (localSettings.serviceProvider === 'custom') {
+              fetchModels('custom');
           }
       }
-  }, [localSettings.serviceProvider, localSettings.sumoPodApiKey, localSettings.electronHubApiKey, localSettings.glmApiKey, localSettings.byteplusApiKey, localSettings.nvidiaApiKey, isOpen]);
+  }, [localSettings.serviceProvider, localSettings.sumoPodApiKey, localSettings.electronHubApiKey, localSettings.glmApiKey, localSettings.byteplusApiKey, localSettings.nvidiaApiKey, localSettings.customApiKey, localSettings.customEndpoint, isOpen]);
 
-  const fetchModels = async (provider: 'sumopod' | 'electronhub' | 'glm' | 'byteplus' | 'nvidia') => {
+  const fetchModels = async (provider: 'sumopod' | 'electronhub' | 'glm' | 'byteplus' | 'nvidia' | 'custom') => {
       let apiKey = "";
       let baseUrl = "";
       
@@ -59,6 +61,10 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
       } else if (provider === 'nvidia') {
           apiKey = localSettings.nvidiaApiKey;
           baseUrl = 'https://integrate.api.nvidia.com/v1/models';
+      } else if (provider === 'custom') {
+          apiKey = localSettings.customApiKey;
+          // Try to derive the models endpoint from the chat completions endpoint
+          baseUrl = localSettings.customEndpoint.replace('/chat/completions', '/models');
       }
 
       if (!apiKey) return;
@@ -67,11 +73,15 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
       setFetchError(null);
       
       try {
+          const headers: any = {
+              'Accept': 'application/json'
+          };
+          if (apiKey) {
+              headers['Authorization'] = `Bearer ${apiKey}`;
+          }
+
           const res = await fetch(baseUrl, {
-              headers: {
-                  'Authorization': `Bearer ${apiKey}`,
-                  'Accept': 'application/json'
-              }
+              headers: headers
           });
           
           if (res.ok) {
@@ -226,7 +236,49 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
                  >
                      <i className="fas fa-microchip mr-2"></i> NVIDIA
                  </button>
+                 <button 
+                    onClick={() => setLocalSettings({...localSettings, serviceProvider: 'custom'})}
+                    className={`py-3 px-2 rounded-lg font-bold border transition text-sm flex items-center justify-center ${localSettings.serviceProvider === 'custom' ? 'bg-purple-600 border-purple-500 text-white' : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700'}`}
+                 >
+                     <i className="fas fa-link mr-2"></i> Custom
+                 </button>
              </div>
+
+             {/* API Key Input for Custom Provider */}
+             {localSettings.serviceProvider === 'custom' && (
+                 <div className="mt-3 space-y-4 animate-fade-in">
+                     <div className="space-y-2">
+                         <label className="block text-sm font-medium text-gray-300">Custom Endpoint URL</label>
+                         <p className="text-xs text-gray-500">URL lengkap menuju endpoint chat completions (contoh: http://bore.pub:1482/v1/chat/completions)</p>
+                         <input
+                             type="text"
+                             value={localSettings.customEndpoint}
+                             onChange={(e) => setLocalSettings({...localSettings, customEndpoint: e.target.value})}
+                             className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 outline-none font-mono text-sm"
+                             placeholder="http://.../v1/chat/completions"
+                         />
+                     </div>
+                     <div className="space-y-2">
+                         <label className="block text-sm font-medium text-gray-300">Custom API Key (Opsional)</label>
+                         <div className="flex gap-2">
+                            <input
+                                type="password"
+                                value={localSettings.customApiKey}
+                                onChange={(e) => setLocalSettings({...localSettings, customApiKey: e.target.value})}
+                                className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 outline-none font-mono text-sm"
+                                placeholder="sk-..."
+                            />
+                            <button 
+                                onClick={() => fetchModels('custom')}
+                                className="px-3 bg-gray-700 hover:bg-gray-600 text-white rounded-lg border border-gray-600"
+                                title="Refresh Models"
+                            >
+                                <i className={`fas fa-sync ${isLoadingModels ? 'animate-spin' : ''}`}></i>
+                            </button>
+                         </div>
+                     </div>
+                 </div>
+             )}
 
              {/* API Key Input for SumoPod */}
              {localSettings.serviceProvider === 'sumopod' && (
@@ -483,6 +535,61 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
                  <input type="file" ref={fileInputRef} onChange={handleRestore} accept=".json" className="hidden" />
              </div>
              {backupStatus && <p className="text-center text-sm text-green-400 mt-2 animate-pulse">{backupStatus}</p>}
+          </div>
+
+          <div className="h-px bg-gray-750 my-4"></div>
+
+          {/* OpenClaw Bridge Integration */}
+          <div className="space-y-3 bg-gray-900/50 p-4 rounded-xl border border-gray-700">
+             <div className="flex justify-between items-center">
+                 <h3 className="text-sm font-bold text-primary-400 uppercase tracking-widest">
+                     <i className="fas fa-network-wired mr-2"></i> OpenClaw Bridge
+                 </h3>
+                 <label className="relative inline-flex items-center cursor-pointer">
+                     <input 
+                         type="checkbox" 
+                         className="sr-only peer"
+                         checked={localSettings.bridgeEnabled}
+                         onChange={(e) => setLocalSettings({...localSettings, bridgeEnabled: e.target.checked})}
+                     />
+                     <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-500"></div>
+                 </label>
+             </div>
+             
+             {localSettings.bridgeEnabled && (
+                 <div className="space-y-4 mt-4 animate-fade-in">
+                     <div className="space-y-2">
+                         <label className="block text-sm font-medium text-gray-300">Bridge Tunnel URL</label>
+                         <p className="text-xs text-gray-500">URL publik dari Node.js Bridge Server Anda (contoh: https://[random].serveousercontent.com)</p>
+                         <input
+                             type="text"
+                             value={localSettings.bridgeUrl}
+                             onChange={(e) => setLocalSettings({...localSettings, bridgeUrl: e.target.value})}
+                             className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-white focus:ring-2 focus:ring-primary-500 outline-none font-mono text-sm"
+                             placeholder="https://..."
+                         />
+                     </div>
+                     <div className="space-y-2">
+                         <label className="block text-sm font-medium text-gray-300">Session ID</label>
+                         <p className="text-xs text-gray-500">ID unik untuk sesi ini. Digunakan untuk sinkronisasi dengan Termux.</p>
+                         <div className="flex gap-2">
+                             <input
+                                 type="text"
+                                 value={localSettings.bridgeSessionId}
+                                 readOnly
+                                 className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-gray-400 outline-none font-mono text-sm cursor-not-allowed"
+                             />
+                             <button 
+                                 onClick={() => setLocalSettings({...localSettings, bridgeSessionId: `session-${Math.random().toString(36).substring(2, 15)}`})}
+                                 className="px-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg border border-gray-600 transition"
+                                 title="Generate New Session ID"
+                             >
+                                 <i className="fas fa-sync"></i>
+                             </button>
+                         </div>
+                     </div>
+                 </div>
+             )}
           </div>
 
         </div>
