@@ -5,6 +5,7 @@ import { loadCharacters, loadChat, saveChat, saveCharacters } from '../utils/sto
 import { generateReply } from '../services/geminiService';
 import { parseJSONL, parseTextChat, exportToJSONL, exportToText } from '../utils/parsers';
 import LorebookModal from '../components/LorebookModal';
+import CollaborativeBridge from '../components/CollaborativeBridge';
 
 interface Props {
   settings: AppSettings;
@@ -92,6 +93,42 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
     }
   }, [messages, view, character]);
 
+  // Sync State to Bridge (SillyTavern-like Context Sync)
+  useEffect(() => {
+    if (view === 'chat' && character && settings.bridgeEnabled && settings.bridgeUrl) {
+        const syncState = async () => {
+            try {
+                const cleanUrl = settings.bridgeUrl.replace(/\/$/, '');
+                await fetch(`${cleanUrl}/sync-state`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: settings.bridgeSessionId,
+                        character: {
+                            name: character.name,
+                            description: character.description,
+                            personality: character.personality,
+                            scenario: character.scenario,
+                            firstMessage: character.firstMessage,
+                            lorebook: character.lorebook
+                        },
+                        messages: messages.map(m => ({
+                            role: m.role,
+                            content: m.candidates?.[m.currentIndex || 0] || m.content
+                        }))
+                    })
+                });
+            } catch (e) {
+                // Ignore sync errors to prevent console spam
+            }
+        };
+        
+        // Debounce sync to avoid spamming the server on rapid changes
+        const timeoutId = setTimeout(syncState, 1500);
+        return () => clearTimeout(timeoutId);
+    }
+  }, [messages, view, character, settings.bridgeEnabled, settings.bridgeUrl, settings.bridgeSessionId]);
+
   // Scroll to bottom on new message (only if not editing/swiping history)
   useEffect(() => {
       if (view === 'chat' && !isLoading) {
@@ -123,11 +160,17 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
     }
   };
 
-  const processResponse = async (history: Message[], userInput: string) => {
+  const processResponse = async (history: Message[], userInput: string, hiddenDirection?: string) => {
       setIsLoading(true);
       try {
+        let promptToSend = userInput;
+        if (hiddenDirection) {
+            const directionPrompt = `[ARAHAN SISTEM (JANGAN DIBALAS SECARA EKSPLISIT, IKUTI SAJA ALURNYA): ${hiddenDirection}]`;
+            promptToSend = promptToSend ? `${promptToSend}\n\n${directionPrompt}` : directionPrompt;
+        }
+
         // character state here already includes the updated lorebook if modified via modal
-        const replyRaw = await generateReply(history, userInput, character!, settings);
+        const replyRaw = await generateReply(history, promptToSend, character!, settings);
         
         // Parse Thought
         const { content, thought } = parseThoughtAndContent(replyRaw);
@@ -162,23 +205,28 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
       }
   };
 
-  const handleSendMessage = async () => {
-    if (!input.trim() || !character || isLoading) return;
+  const handleSendMessage = async (overrideContent?: string, hiddenDirection?: string) => {
+    const textToSend = typeof overrideContent === 'string' ? overrideContent : input;
+    if ((!textToSend.trim() && !hiddenDirection?.trim()) || !character || isLoading) return;
 
-    const userMsg: Message = { 
-        id: uuid(),
-        role: 'user', 
-        content: input, 
-        timestamp: Date.now(),
-        candidates: [input],
-        currentIndex: 0
-    };
+    let newHistory = [...messages];
     
-    const newHistory = [...messages, userMsg];
-    setMessages(newHistory);
-    setInput('');
+    if (textToSend.trim()) {
+        const userMsg: Message = { 
+            id: uuid(),
+            role: 'user', 
+            content: textToSend, 
+            timestamp: Date.now(),
+            candidates: [textToSend],
+            currentIndex: 0
+        };
+        
+        newHistory = [...messages, userMsg];
+        setMessages(newHistory);
+        if (textToSend === input) setInput('');
+    }
     
-    await processResponse(newHistory, input);
+    await processResponse(newHistory, textToSend, hiddenDirection);
   };
 
   // --- LOREBOOK HANDLING ---
@@ -705,6 +753,15 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
           lorebook={character.lorebook || []}
           onSave={handleSaveLorebook}
           settings={settings}
+      />
+
+      {/* COLLABORATIVE BRIDGE (MODE C) */}
+      <CollaborativeBridge 
+          settings={settings}
+          character={character}
+          onInjectDirection={(direction) => handleSendMessage('', direction)}
+          onInjectUserMessage={(message) => handleSendMessage(message)}
+          lastCharacterMessage={messages.length > 0 && messages[messages.length - 1].role === 'model' ? messages[messages.length - 1] : null}
       />
     </div>
   );
