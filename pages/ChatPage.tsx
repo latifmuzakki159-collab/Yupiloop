@@ -6,6 +6,7 @@ import { generateReply } from '../services/geminiService';
 import { parseJSONL, parseTextChat, exportToJSONL, exportToText } from '../utils/parsers';
 import LorebookModal from '../components/LorebookModal';
 import CollaborativeBridge from '../components/CollaborativeBridge';
+import ConfirmModal from '../components/ConfirmModal';
 
 interface Props {
   settings: AppSettings;
@@ -43,6 +44,16 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
   const [isLorebookOpen, setIsLorebookOpen] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editContent, setEditContent] = useState('');
+
+  // Confirmation Modals State
+  const [confirmAction, setConfirmAction] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  }>({ isOpen: false, title: '', message: '', onConfirm: () => {} });
+
+  const closeConfirm = () => setConfirmAction(prev => ({ ...prev, isOpen: false }));
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -141,22 +152,34 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
   };
 
   const handleResetChat = async (silent: boolean = false) => {
-    if (!silent && !confirm('Hapus semua riwayat chat dengan karakter ini?')) return;
-    
-    if (character) {
-        const initial: Message = { 
-            id: uuid(),
-            role: 'model', 
-            content: character.firstMessage, 
-            timestamp: Date.now(),
-            candidates: [character.firstMessage],
-            thoughts: [],
-            currentIndex: 0
-        };
-        setMessages([initial]);
-        await saveChat(character.id, [initial]);
-        setHasHistory(false);
-        if(!silent) setView('landing');
+    const doReset = async () => {
+        if (character) {
+            const initial: Message = { 
+                id: uuid(),
+                role: 'model', 
+                content: character.firstMessage, 
+                timestamp: Date.now(),
+                candidates: [character.firstMessage],
+                thoughts: [],
+                currentIndex: 0
+            };
+            setMessages([initial]);
+            await saveChat(character.id, [initial]);
+            setHasHistory(false);
+            if(!silent) setView('landing');
+        }
+        closeConfirm();
+    };
+
+    if (!silent) {
+        setConfirmAction({
+            isOpen: true,
+            title: 'Hapus Riwayat Chat',
+            message: 'Apakah Anda yakin ingin menghapus semua riwayat obrolan dengan karakter ini? Tindakan ini tidak dapat dibatalkan.',
+            onConfirm: doReset
+        });
+    } else {
+        doReset();
     }
   };
 
@@ -316,11 +339,16 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
   // --- BRANCHING, EDITING & THOUGHT FUNCTIONS ---
 
   const handleDeleteMessage = (targetId: string) => {
-      if(confirm('Hapus pesan ini?')) {
-          // Use ID filtering instead of index splicing to ensure correct deletion
-          const newMsgs = messages.filter(m => m.id !== targetId);
-          setMessages(newMsgs);
-      }
+      setConfirmAction({
+          isOpen: true,
+          title: 'Hapus Pesan',
+          message: 'Apakah Anda yakin ingin menghapus pesan ini?',
+          onConfirm: () => {
+              const newMsgs = messages.filter(m => m.id !== targetId);
+              setMessages(newMsgs);
+              closeConfirm();
+          }
+      });
   };
 
   const toggleThought = (msgId: string) => {
@@ -762,6 +790,15 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
           onInjectDirection={(direction) => handleSendMessage('', direction)}
           onInjectUserMessage={(message) => handleSendMessage(message)}
           lastCharacterMessage={messages.length > 0 && messages[messages.length - 1].role === 'model' ? messages[messages.length - 1] : null}
+      />
+
+      {/* CONFIRMATION MODAL */}
+      <ConfirmModal 
+          isOpen={confirmAction.isOpen}
+          title={confirmAction.title}
+          message={confirmAction.message}
+          onConfirm={confirmAction.onConfirm}
+          onCancel={closeConfirm}
       />
     </div>
   );
