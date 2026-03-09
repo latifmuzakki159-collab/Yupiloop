@@ -11,6 +11,10 @@ export interface Message {
   thought?: string; // The active thought process
   thoughts?: string[]; // Array of thoughts corresponding to candidates
   isThoughtExpanded?: boolean; // UI Toggle state
+  // Tree Structure Support
+  parentId?: string | null;
+  childrenIds?: string[];
+  branchId?: string;
 }
 
 export interface LorebookEntry {

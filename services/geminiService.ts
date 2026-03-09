@@ -293,18 +293,36 @@ export const makeLLMRequest = async (
             geminiConfig.responseMimeType = "application/json";
         }
 
-        const chat = ai.chats.create({
-            model: settings.model,
-            config: geminiConfig,
-            history: messages.slice(0, -1).map(m => ({
-                role: m.role === 'model' ? 'model' : 'user',
-                parts: [{ text: m.content }]
-            }))
-        });
+        // Normalize history for Gemini (must alternate, start with user)
+        let rawGeminiHistory = messages.map(m => ({
+            role: (m.role === 'model' || m.role === 'assistant') ? 'model' : 'user',
+            parts: [{ text: m.content || " " }]
+        }));
 
-        const lastMsg = messages[messages.length - 1];
-        const response = await chat.sendMessage({
-            message: lastMsg.content
+        // Collapse consecutive messages of the same role
+        const collapsedHistory: { role: string, parts: { text: string }[] }[] = [];
+        for (const msg of rawGeminiHistory) {
+            if (collapsedHistory.length === 0) {
+                collapsedHistory.push(msg);
+            } else {
+                const last = collapsedHistory[collapsedHistory.length - 1];
+                if (last.role === msg.role) {
+                    last.parts[0].text += "\n\n" + msg.parts[0].text;
+                } else {
+                    collapsedHistory.push(msg);
+                }
+            }
+        }
+
+        // Ensure history starts with 'user'
+        if (collapsedHistory.length > 0 && collapsedHistory[0].role === 'model') {
+            collapsedHistory.shift();
+        }
+
+        const response = await ai.models.generateContent({
+            model: settings.model,
+            contents: collapsedHistory,
+            config: geminiConfig
         });
 
         return response.text || "";
