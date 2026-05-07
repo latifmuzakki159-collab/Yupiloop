@@ -11,17 +11,21 @@ export interface Message {
   thought?: string; // The active thought process
   thoughts?: string[]; // Array of thoughts corresponding to candidates
   isThoughtExpanded?: boolean; // UI Toggle state
-  // Tree Structure Support
+  // Tree Structure
   parentId?: string | null;
   childrenIds?: string[];
   branchId?: string;
+  // Metadata for lorebook tracking (SillyTavern style)
+  activeLoreIds?: string[];
 }
 
 export interface LorebookEntry {
   id: string;
   keys: string[]; // Keywords to trigger this entry
+  secondaryKeys?: string[]; // Selective keys (AND logic)
   entry: string; // The lore text
   enabled: boolean; // Toggle without deleting
+  alwaysOn?: boolean; // Always inject this entry regardless of keywords
 }
 
 export interface Character {
@@ -35,13 +39,23 @@ export interface Character {
   lorebook?: LorebookEntry[];
 }
 
+export interface PromptEntry {
+  id: string;
+  name: string;
+  content: string;
+  role: 'system' | 'user' | 'assistant';
+  enabled: boolean;
+  injectionPosition?: number; // 0 for top, 1 for bottom, etc.
+  injectionDepth?: number; // How many messages deep to inject
+}
+
 export interface AppSettings {
   model: string;
-  systemPrompt: string; // The "Jailbreak"
-  contextLimit: number; // Estimated Token Limit (not message count)
+  systemPrompt: string; // Legacy field, we'll keep for compatibility but prefer promptEntries
+  promptEntries: PromptEntry[];
+  contextLimit: number;
   temperature: number;
-  userName: string; // Name of the user for replacement
-  // Multi-provider support
+  userName: string;
   serviceProvider: 'google' | 'sumopod' | 'electronhub' | 'glm' | 'byteplus' | 'nvidia' | 'custom';
   sumoPodApiKey: string;
   electronHubApiKey: string;
@@ -50,7 +64,6 @@ export interface AppSettings {
   nvidiaApiKey: string;
   customApiKey: string;
   customEndpoint: string;
-  // OpenClaw Bridge Integration
   bridgeEnabled: boolean;
   bridgeUrl: string;
   bridgeSessionId: string;
@@ -61,15 +74,25 @@ export const DEFAULT_JAILBREAK = `Write {{char}}'s next reply in a fictional rol
 export const DEFAULT_SETTINGS: AppSettings = {
   model: 'gemini-3-flash-preview',
   systemPrompt: DEFAULT_JAILBREAK,
-  contextLimit: 1000000, // Default to 1M tokens
+  promptEntries: [
+    {
+      id: 'main-prompt',
+      name: 'Main Prompt',
+      content: DEFAULT_JAILBREAK,
+      role: 'system',
+      enabled: true,
+      injectionPosition: 0
+    }
+  ],
+  contextLimit: 16000,
   temperature: 0.9,
   userName: 'User',
   serviceProvider: 'google',
-  sumoPodApiKey: 'sk-gs_bkeqI9RK79F9iSApGKA', // Default key provided
-  electronHubApiKey: 'ek-CbpYgLxXxAw4KjQAs9mWaKeEQmoeUE57ZvCYdDbyzRDndAApq0', // Default ElectronHub key
-  glmApiKey: '16f8af5bcd274b488b8fc4eaf16fcd02.qIqwWH0SczWYxusu', // Default GLM key
-  byteplusApiKey: '1be8a3be-61ae-4d88-ba58-7cea98965669', // Default BytePlus key
-  nvidiaApiKey: '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', // Default NVIDIA key
+  sumoPodApiKey: 'sk-gs_bkeqI9RK79F9iSApGKA',
+  electronHubApiKey: 'ek-CbpYgLxXxAw4KjQAs9mWaKeEQmoeUE57ZvCYdDbyzRDndAApq0',
+  glmApiKey: '16f8af5bcd274b488b8fc4eaf16fcd02.qIqwWH0SczWYxusu',
+  byteplusApiKey: '1be8a3be-61ae-4d88-ba58-7cea98965669',
+  nvidiaApiKey: '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',
   customApiKey: '',
   customEndpoint: 'http://bore.pub:1482/v1/chat/completions',
   bridgeEnabled: false,

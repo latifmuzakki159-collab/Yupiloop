@@ -1,7 +1,8 @@
 
 import React from 'react';
-import { AppSettings, AVAILABLE_MODELS } from '../types';
+import { AppSettings, AVAILABLE_MODELS, PromptEntry } from '../types';
 import { exportAllData, importAllData } from '../utils/storage';
+import AdvancedPromptManager from './AdvancedPromptManager';
 
 interface Props {
   isOpen: boolean;
@@ -62,12 +63,28 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
           apiKey = localSettings.nvidiaApiKey;
           baseUrl = 'https://integrate.api.nvidia.com/v1/models';
       } else if (provider === 'custom') {
-          apiKey = localSettings.customApiKey;
+          apiKey = localSettings.customApiKey?.trim() || "";
+          
+          let sanitizedUrl = localSettings.customEndpoint.trim();
+          if (sanitizedUrl && !sanitizedUrl.startsWith('http://') && !sanitizedUrl.startsWith('https://')) {
+              if (sanitizedUrl.startsWith('localhost') || sanitizedUrl.startsWith('127.0.0.1') || sanitizedUrl.startsWith('192.168.')) {
+                  sanitizedUrl = 'http://' + sanitizedUrl;
+              } else {
+                  sanitizedUrl = 'https://' + sanitizedUrl;
+              }
+          }
+          
           // Try to derive the models endpoint from the chat completions endpoint
-          baseUrl = localSettings.customEndpoint.replace('/chat/completions', '/models');
+          if (sanitizedUrl.includes('/chat/completions')) {
+              baseUrl = sanitizedUrl.replace(/\/chat\/completions\/?$/, '/models');
+          } else {
+              // If they just provided a base URL or it doesn't end with chat/completions
+              baseUrl = sanitizedUrl.replace(/\/$/, '') + '/models';
+          }
       }
 
-      if (!apiKey) return;
+      if (!baseUrl) return;
+      if (!apiKey && provider !== 'custom') return;
       
       setIsLoadingModels(true);
       setFetchError(null);
@@ -86,11 +103,21 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
           
           if (res.ok) {
               const data = await res.json();
-              // Standard OpenAI format: { data: [{ id: '...', ... }] }
-              if (Array.isArray(data.data)) {
-                  const models = data.data.map((m: any) => ({
-                      id: m.id,
-                      name: m.id // Often API just gives ID
+              
+              // Handle various API return formats (OpenAI standard, Ollama, generic arrays)
+              let modelsArray: any[] = [];
+              if (data.data && Array.isArray(data.data)) {
+                  modelsArray = data.data;
+              } else if (Array.isArray(data)) {
+                  modelsArray = data;
+              } else if (data.models && Array.isArray(data.models)) {
+                  modelsArray = data.models;
+              }
+
+              if (modelsArray.length > 0) {
+                  const models = modelsArray.map((m: any) => ({
+                      id: m.id || m.name || String(m),
+                      name: m.id || m.name || String(m)
                   })).sort((a: any, b: any) => a.id.localeCompare(b.id));
                   
                   setExternalModels(models);
@@ -102,7 +129,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
                   }
               } else {
                    setExternalModels([]);
-                   setFetchError('Format respon server tidak dikenali.');
+                   setFetchError('Format respon server tidak dikenali atau kosong.');
               }
           } else {
               setExternalModels([]);
@@ -476,7 +503,8 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
               onChange={(e) => setLocalSettings({...localSettings, contextLimit: parseInt(e.target.value)})}
               className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-white focus:ring-2 focus:ring-primary-500 outline-none"
             >
-                <option value={8192}>8k Token (Standar)</option>
+                <option value={8192}>8k Token (Sangat Ringan)</option>
+                <option value={16384}>16k Token (Standar/Aman untuk Free Tier)</option>
                 <option value={32768}>32k Token (Panjang)</option>
                 <option value={128000}>128k Token (Sangat Panjang)</option>
                 <option value={500000}>500k Token (Masif)</option>
@@ -504,21 +532,11 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
             />
           </div>
 
-          {/* Jailbreak / System Prompt */}
-          <div className="space-y-2">
-            <label className="block text-sm font-medium text-gray-300">
-              Instruksi Sistem / Jailbreak
-            </label>
-            <p className="text-xs text-gray-500 mb-2">
-              Model akan dipaksa mengikuti instruksi ini. Gunakan placeholder <code>{`{{char}}`}</code> dan <code>{`{{user}}`}</code>.
-            </p>
-            <textarea
-              value={localSettings.systemPrompt}
-              onChange={(e) => setLocalSettings({...localSettings, systemPrompt: e.target.value})}
-              rows={6}
-              className="w-full bg-gray-950 border border-gray-750 rounded-lg p-3 text-sm text-gray-200 font-mono focus:ring-2 focus:ring-primary-500 outline-none resize-y"
-            />
-          </div>
+          {/* Jailbreak / System Prompt (Legacy hidden, using Advanced Prompts now) */}
+          <AdvancedPromptManager 
+            prompts={localSettings.promptEntries || []}
+            onChange={(newPrompts) => setLocalSettings({...localSettings, promptEntries: newPrompts})}
+          />
           
           <div className="h-px bg-gray-750 my-4"></div>
 
@@ -532,7 +550,7 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, settings, onSave, onD
                  <button onClick={() => fileInputRef.current?.click()} className="bg-gray-700 hover:bg-gray-600 text-white p-3 rounded-lg flex items-center justify-center gap-2 transition">
                      <i className="fas fa-upload"></i> Restore Data
                  </button>
-                 <input type="file" ref={fileInputRef} onChange={handleRestore} accept=".json" className="hidden" />
+                 <input type="file" ref={fileInputRef} onChange={handleRestore} accept=".json,application/json,text/plain,*/*" className="hidden" />
              </div>
              {backupStatus && <p className="text-center text-sm text-green-400 mt-2 animate-pulse">{backupStatus}</p>}
           </div>

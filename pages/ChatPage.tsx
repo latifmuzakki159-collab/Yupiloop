@@ -2,13 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { AppSettings, Character, Message, LorebookEntry } from '../types';
 import { loadCharacters, loadChat, saveChat, saveCharacters } from '../utils/storage';
-import { generateReply } from '../services/geminiService';
+import { generateReply, extractNewLore } from '../services/geminiService';
 import { parseJSONL, parseTextChat, exportToJSONL, exportToText } from '../utils/parsers';
 import LorebookModal from '../components/LorebookModal';
 import CollaborativeBridge from '../components/CollaborativeBridge';
 import ConfirmModal from '../components/ConfirmModal';
-import ChatTree from '../components/ChatTree';
-import { linearToTree, getBranchPath, findLeafNodes } from '../utils/treeHelpers';
 
 interface Props {
   settings: AppSettings;
@@ -23,9 +21,23 @@ const parseThoughtAndContent = (rawText: string): { content: string, thought: st
     const match = rawText.match(thinkRegex);
 
     if (match) {
-        const thought = match[1].trim();
-        const content = rawText.replace(thinkRegex, '').trim();
+        let thought = match[1].trim();
+        let content = rawText.replace(thinkRegex, '').trim();
+        
+        if (content === '' && thought !== '') {
+            content = "[Peringatan: Model hanya menghasilkan proses berpikir (think), ini biasanya karena token limit (max_tokens). Cobalah perbesar maxOutputTokens di Settings atau suruh 'Lanjutkan'.]";
+        }
         return { content, thought };
+    }
+
+    // Check if there's an unclosed <think> tag (hit max tokens before closing)
+    const unclosedThinkRegex = /<think>([\s\S]*)/i;
+    const unclosedMatch = rawText.match(unclosedThinkRegex);
+    if (unclosedMatch) {
+        return { 
+            content: "[Peringatan: Proses berpikir model terpotong di tengah jalan karena token limit. Perbesar nilai max_tokens di pengaturan.]", 
+            thought: unclosedMatch[1].trim() 
+        };
     }
 
     return { content: rawText, thought: '' };
@@ -36,28 +48,26 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
   const [character, setCharacter] = useState<Character | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [view, setView] = useState<'landing' | 'chat'>('landing');
-  const [viewMode, setViewMode] = useState<'chat' | 'tree'>('chat');
-  const [currentNodeId, setCurrentNodeId] = useState<string | null>(null);
   const [hasHistory, setHasHistory] = useState(false);
   
   // UI States
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const isLoadingRef = useRef(false);
   const [showAdvancedControls, setShowAdvancedControls] = useState(true); // Default ON, toggleable
   const [showMenu, setShowMenu] = useState(false);
   const [isLorebookOpen, setIsLorebookOpen] = useState(false);
-  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [editContent, setEditContent] = useState('');
-
-  // Confirmation Modals State
-  const [confirmAction, setConfirmAction] = useState<{
-    isOpen: boolean;
-    title: string;
-    message: string;
-    onConfirm: () => void;
-  }>({ isOpen: false, title: '', message: '', onConfirm: () => {} });
-
-  const closeConfirm = () => setConfirmAction(prev => ({ ...prev, isOpen: false }));
+  
+  // Modals state
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [msgToDelete, setMsgToDelete] = useState<string | null>(null);
+  const [visibleLoreMsgId, setVisibleLoreMsgId] = useState<string | null>(null);
+  const [newLoreNotification, setNewLoreNotification] = useState<boolean>(false);
+  const [suggestedLores, setSuggestedLores] = useState<LorebookEntry[]>([]);
+  const [showSuggestedLoreModal, setShowSuggestedLoreModal] = useState(false);
+  const [downloadLink, setDownloadLink] = useState<{ url: string, filename: string, content: string } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -71,25 +81,16 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
           setCharacter(found);
           const history = await loadChat(found.id);
           if (history.length > 0) {
-            // Ensure legacy messages have candidates structure AND IDs AND Tree structure
-            let migrated = history.map(m => ({
+            // Ensure legacy messages have candidates structure AND IDs
+            const migrated = history.map(m => ({
                 ...m,
                 id: m.id || uuid(), // Ensure ID exists
                 candidates: m.candidates || [m.content],
                 thoughts: m.thoughts || (m.thought ? [m.thought] : []), // Migrate thoughts
                 currentIndex: m.currentIndex || 0
             }));
-            
-            // Convert to tree if it's linear
-            migrated = linearToTree(migrated);
-            
             setMessages(migrated);
             setHasHistory(true);
-            
-            // Set current node to the last leaf node in the main branch (or just the last message for now)
-            if (migrated.length > 0) {
-                setCurrentNodeId(migrated[migrated.length - 1].id);
-            }
           } else {
             // Fresh start
             const initialMsg: Message = {
@@ -99,14 +100,10 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
                 timestamp: Date.now(),
                 candidates: [found.firstMessage],
                 thoughts: [],
-                currentIndex: 0,
-                parentId: null,
-                childrenIds: [],
-                branchId: 'main'
+                currentIndex: 0
             };
             setMessages([initialMsg]);
             setHasHistory(false);
-            setCurrentNodeId(initialMsg.id);
           }
         }
     };
@@ -127,10 +124,6 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
         const syncState = async () => {
             try {
                 const cleanUrl = settings.bridgeUrl.replace(/\/$/, '');
-                
-                // Only sync the active path for the bridge to avoid confusing it with branches
-                const activeMessages = currentNodeId ? getBranchPath(messages, currentNodeId) : messages;
-                
                 await fetch(`${cleanUrl}/sync-state`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -144,7 +137,7 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
                             firstMessage: character.firstMessage,
                             lorebook: character.lorebook
                         },
-                        messages: activeMessages.map(m => ({
+                        messages: messages.map(m => ({
                             role: m.role,
                             content: m.candidates?.[m.currentIndex || 0] || m.content
                         }))
@@ -159,57 +152,48 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
         const timeoutId = setTimeout(syncState, 1500);
         return () => clearTimeout(timeoutId);
     }
-  }, [messages, view, character, settings.bridgeEnabled, settings.bridgeUrl, settings.bridgeSessionId, currentNodeId]);
+  }, [messages, view, character, settings.bridgeEnabled, settings.bridgeUrl, settings.bridgeSessionId]);
 
   // Scroll to bottom on new message (only if not editing/swiping history)
   useEffect(() => {
-      if (view === 'chat' && viewMode === 'chat' && !isLoading) {
+      if (view === 'chat' && !isLoading) {
           messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }
-  }, [messages.length, view, viewMode]);
+  }, [messages.length, view]);
 
   const handleStartChat = () => {
     setView('chat');
   };
 
   const handleResetChat = async (silent: boolean = false) => {
-    const doReset = async () => {
-        if (character) {
-            const initial: Message = { 
-                id: uuid(),
-                role: 'model', 
-                content: character.firstMessage, 
-                timestamp: Date.now(),
-                candidates: [character.firstMessage],
-                thoughts: [],
-                currentIndex: 0,
-                parentId: null,
-                childrenIds: [],
-                branchId: 'main'
-            };
-            setMessages([initial]);
-            setCurrentNodeId(initial.id);
-            await saveChat(character.id, [initial]);
-            setHasHistory(false);
-            if(!silent) setView('landing');
+    if (!silent && !showResetConfirm) {
+        setShowResetConfirm(true);
+        return;
+    }
+    
+    if (character) {
+        const initial: Message = { 
+            id: uuid(),
+            role: 'model', 
+            content: character.firstMessage, 
+            timestamp: Date.now(),
+            candidates: [character.firstMessage],
+            thoughts: [],
+            currentIndex: 0
+        };
+        setMessages([initial]);
+        await saveChat(character.id, [initial]);
+        setHasHistory(false);
+        setShowResetConfirm(false);
+        if(!silent) {
+            setView('landing');
         }
-        closeConfirm();
-    };
-
-    if (!silent) {
-        setConfirmAction({
-            isOpen: true,
-            title: 'Hapus Riwayat Chat',
-            message: 'Apakah Anda yakin ingin menghapus semua riwayat obrolan dengan karakter ini? Tindakan ini tidak dapat dibatalkan.',
-            onConfirm: doReset
-        });
-    } else {
-        doReset();
     }
   };
 
-  const processResponse = async (history: Message[], userInput: string, hiddenDirection?: string, parentId?: string) => {
+  const processResponse = async (fullHistory: Message[], userInput: string, hiddenDirection?: string) => {
       setIsLoading(true);
+      isLoadingRef.current = true;
       try {
         let promptToSend = userInput;
         if (hiddenDirection) {
@@ -217,16 +201,16 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
             promptToSend = promptToSend ? `${promptToSend}\n\n${directionPrompt}` : directionPrompt;
         }
 
-        // character state here already includes the updated lorebook if modified via modal
-        const replyRaw = await generateReply(history, promptToSend, character!, settings);
+        // generateReply expects history EXCLUDING the new message
+        const baselineHistory = fullHistory.slice(0, -1);
+        const { content: replyContent, activeLoreIds } = await generateReply(baselineHistory, promptToSend, character!, settings);
         
         // Parse Thought
-        const { content, thought } = parseThoughtAndContent(replyRaw);
+        const { content, thought } = parseThoughtAndContent(replyContent);
 
         // Add new Model message
-        const newId = uuid();
         const botMsg: Message = { 
-            id: newId,
+            id: uuid(),
             role: 'model', 
             content: content, 
             thought: thought, // Active thought
@@ -234,104 +218,75 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
             candidates: [content],
             thoughts: [thought], // Store parallel to candidates
             currentIndex: 0,
-            isThoughtExpanded: false,
-            parentId: parentId || null,
-            childrenIds: [],
-            branchId: uuid() // New branch for the reply
+            isThoughtExpanded: content.trim() === '' && thought.trim() !== '',
+            activeLoreIds: activeLoreIds
         };
         
-        setMessages(prev => {
-            const updated = [...prev, botMsg];
-            if (parentId) {
-                const parentIndex = updated.findIndex(m => m.id === parentId);
-                if (parentIndex !== -1) {
-                    updated[parentIndex] = {
-                        ...updated[parentIndex],
-                        childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                    };
-                }
-            }
-            return updated;
-        });
-        setCurrentNodeId(newId);
+        // Use functional update to ensure we don't overwrite user message
+        setMessages(prev => [...prev, botMsg]);
+
+        // --- SMART LORE EXTRACTION ---
+        // Run in background to avoid blocking initial response display
+        setTimeout(async () => {
+             // Use full history including bot reply
+             const newLores = await extractNewLore([...fullHistory, botMsg], settings, character!);
+             if (newLores && newLores.length > 0) {
+                 const entriesToAdd: LorebookEntry[] = newLores.map(l => ({
+                     id: uuid(),
+                     keys: l.keys || [],
+                     entry: l.entry || "",
+                     enabled: true
+                 }));
+                 
+                 // Store as suggestions
+                 setSuggestedLores(prev => [...prev, ...entriesToAdd]);
+                 setNewLoreNotification(true);
+                 setTimeout(() => setNewLoreNotification(false), 5000);
+             }
+        }, 1000);
+
       } catch (error: any) {
         // Improved Error Handling: Inject error as a system message
         const errorMessage = `[SYSTEM ERROR]: ${error.message || 'Terjadi kesalahan tidak dikenal saat menghubungi AI.'}`;
-        const newId = uuid();
         const errorMsg: Message = { 
-            id: newId,
+            id: uuid(),
             role: 'model', 
             content: errorMessage, 
             timestamp: Date.now(),
             candidates: [errorMessage],
-            currentIndex: 0,
-            parentId: parentId || null,
-            childrenIds: [],
-            branchId: 'error'
+            currentIndex: 0
         };
-        setMessages(prev => {
-            const updated = [...prev, errorMsg];
-            if (parentId) {
-                const parentIndex = updated.findIndex(m => m.id === parentId);
-                if (parentIndex !== -1) {
-                    updated[parentIndex] = {
-                        ...updated[parentIndex],
-                        childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                    };
-                }
-            }
-            return updated;
-        });
-        setCurrentNodeId(newId);
+        setMessages(prev => [...prev, errorMsg]);
       } finally {
         setIsLoading(false);
+        isLoadingRef.current = false;
       }
   };
 
   const handleSendMessage = async (overrideContent?: string, hiddenDirection?: string) => {
     const textToSend = typeof overrideContent === 'string' ? overrideContent : input;
-    if ((!textToSend.trim() && !hiddenDirection?.trim()) || !character || isLoading) return;
-
-    // Get the active path up to the current node
-    const activeHistory = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-    let newHistory = [...activeHistory];
-    let parentId = currentNodeId;
+    if ((!textToSend.trim() && !hiddenDirection?.trim()) || !character || isLoadingRef.current) return;
+    
+    isLoadingRef.current = true;
+    let newHistory = [...messages];
     
     if (textToSend.trim()) {
-        const newId = uuid();
         const userMsg: Message = { 
-            id: newId,
+            id: uuid(),
             role: 'user', 
             content: textToSend, 
             timestamp: Date.now(),
             candidates: [textToSend],
-            currentIndex: 0,
-            parentId: parentId,
-            childrenIds: [],
-            branchId: uuid()
+            currentIndex: 0
         };
         
-        setMessages(prev => {
-            const updated = [...prev, userMsg];
-            if (parentId) {
-                const parentIndex = updated.findIndex(m => m.id === parentId);
-                if (parentIndex !== -1) {
-                    updated[parentIndex] = {
-                        ...updated[parentIndex],
-                        childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                    };
-                }
-            }
-            return updated;
-        });
-        
-        newHistory = [...activeHistory, userMsg];
-        parentId = newId;
-        setCurrentNodeId(newId);
+        newHistory = [...messages, userMsg];
+        setMessages(newHistory);
         if (textToSend === input) setInput('');
     }
     
-    await processResponse(newHistory, textToSend, hiddenDirection, parentId);
+    // Pass newHistory which includes the userMsg
+    await processResponse(newHistory, textToSend, hiddenDirection);
   };
 
   // --- LOREBOOK HANDLING ---
@@ -376,18 +331,8 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
                     candidates: m.candidates || [m.content],
                     currentIndex: m.currentIndex || 0
                 }));
-                const treeMigrated = linearToTree(migrated);
-                setMessages(treeMigrated);
-                
-                // Set currentNodeId to the last leaf
-                const leaves = findLeafNodes(treeMigrated);
-                if (leaves.length > 0) {
-                    setCurrentNodeId(leaves[leaves.length - 1].id);
-                } else if (treeMigrated.length > 0) {
-                    setCurrentNodeId(treeMigrated[treeMigrated.length - 1].id);
-                }
-
-                await saveChat(character.id, treeMigrated); 
+                setMessages(migrated);
+                await saveChat(character.id, migrated); 
                 setHasHistory(true);
                 alert(`Berhasil mengimpor ${newMessages.length} pesan!`);
             } else {
@@ -408,8 +353,7 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
       const filename = `${character.name}_chat.${format === 'text' ? 'txt' : format}`;
 
       // Use active content for export
-      const activePath = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-      const activeMessages = activePath.map(m => ({
+      const activeMessages = messages.map(m => ({
           ...m,
           content: m.candidates?.[m.currentIndex || 0] || m.content
       }));
@@ -420,67 +364,40 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
           content = exportToText(activeMessages, character.name);
       }
 
-      const blob = new Blob([content], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
+      try {
+          const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.style.display = 'none';
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+              document.body.removeChild(a);
+              window.URL.revokeObjectURL(url);
+          }, 100);
+      } catch (e) {
+          console.error("Auto download failed", e);
+      }
+      
+      // Fallback: Selalu setelan link unduhan manual untuk browser seperti Via yang memblokir klik otomatis
+      const fallbackUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(content)}`;
+      setDownloadLink({ url: fallbackUrl, filename, content });
   };
 
   // --- BRANCHING, EDITING & THOUGHT FUNCTIONS ---
 
-  const handleDeleteMessage = (targetId: string) => {
-      setConfirmAction({
-          isOpen: true,
-          title: 'Hapus Pesan',
-          message: 'Apakah Anda yakin ingin menghapus pesan ini beserta semua balasannya?',
-          onConfirm: () => {
-              // Find all descendants to delete
-              const idsToDelete = new Set<string>([targetId]);
-              let added = true;
-              while (added) {
-                  added = false;
-                  for (const msg of messages) {
-                      if (msg.parentId && idsToDelete.has(msg.parentId) && !idsToDelete.has(msg.id)) {
-                          idsToDelete.add(msg.id);
-                          added = true;
-                      }
-                  }
-              }
+  const requestDeleteMessage = (targetId: string) => {
+      setMsgToDelete(targetId);
+  };
 
-              setMessages(prev => {
-                  const newMsgs = prev.filter(m => !idsToDelete.has(m.id));
-                  
-                  // Update parent's childrenIds
-                  const targetMsg = prev.find(m => m.id === targetId);
-                  if (targetMsg && targetMsg.parentId) {
-                      const parentIndex = newMsgs.findIndex(m => m.id === targetMsg.parentId);
-                      if (parentIndex !== -1) {
-                          newMsgs[parentIndex] = {
-                              ...newMsgs[parentIndex],
-                              childrenIds: (newMsgs[parentIndex].childrenIds || []).filter(id => id !== targetId)
-                          };
-                      }
-                  }
-                  
-                  // If currentNodeId is deleted, find a new one
-                  if (currentNodeId && idsToDelete.has(currentNodeId)) {
-                      const remainingLeaves = findLeafNodes(newMsgs);
-                      if (remainingLeaves.length > 0) {
-                          // Try to find a leaf on the same branch, or just the last leaf
-                          setCurrentNodeId(remainingLeaves[remainingLeaves.length - 1].id);
-                      } else {
-                          setCurrentNodeId(null);
-                      }
-                  }
-                  
-                  return newMsgs;
-              });
-              closeConfirm();
-          }
-      });
+  const confirmDeleteMessage = () => {
+      if (msgToDelete) {
+          const newMsgs = messages.filter(m => m.id !== msgToDelete);
+          setMessages(newMsgs);
+          setMsgToDelete(null);
+      }
   };
 
   const toggleThought = (msgId: string) => {
@@ -492,166 +409,118 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
       }));
   };
 
-  const handleSwipe = (index: number, direction: 'left' | 'right') => {
-      const activePath = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-      const targetMsg = activePath[index];
-      if (!targetMsg || !targetMsg.candidates) return;
-      
-      const current = targetMsg.currentIndex || 0;
-      let next = direction === 'left' ? current - 1 : current + 1;
-      
-      // Loop around
-      if (next < 0) next = targetMsg.candidates.length - 1;
-      if (next >= targetMsg.candidates.length) next = 0;
+  const handleSwipe = (id: string, direction: 'left' | 'right') => {
+      setMessages(prev => prev.map(msg => {
+          if (msg.id !== id) return msg;
+          if (!msg.candidates) return msg;
+          
+          const current = msg.currentIndex || 0;
+          let next = direction === 'left' ? current - 1 : current + 1;
+          
+          // Loop around
+          if (next < 0) next = msg.candidates.length - 1;
+          if (next >= msg.candidates.length) next = 0;
 
-      setMessages(prev => prev.map(m => {
-          if (m.id === targetMsg.id) {
-              const updatedMsg = { ...m };
-              updatedMsg.currentIndex = next;
-              updatedMsg.content = updatedMsg.candidates![next]; // Sync content for compatibility
-              
-              // Sync Thought if array exists
-              if (updatedMsg.thoughts && updatedMsg.thoughts.length > next) {
-                  updatedMsg.thought = updatedMsg.thoughts[next];
-              } else {
-                  updatedMsg.thought = '';
-              }
-              return updatedMsg;
-          }
-          return m;
+          return {
+              ...msg,
+              currentIndex: next,
+              content: msg.candidates[next],
+              thought: msg.thoughts && msg.thoughts.length > next ? msg.thoughts[next] : ''
+          };
       }));
   };
 
-  const handleStartEdit = (index: number) => {
-      // index here is the index in the active path, not the full messages array
-      const activePath = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-      const msg = activePath[index];
+  const handleStartEdit = (id: string) => {
+      const msg = messages.find(m => m.id === id);
       if (!msg) return;
       const activeContent = msg.candidates?.[msg.currentIndex || 0] || msg.content;
       setEditContent(activeContent);
-      setEditingIndex(index);
+      setEditingId(id);
   };
 
-  const handleSaveEdit = (index: number) => {
-      const activePath = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-      const originalMsg = activePath[index];
-      if (!originalMsg) return;
-      
-      const newId = uuid();
-      const newMsg: Message = {
-          ...originalMsg,
-          id: newId,
-          content: editContent,
-          candidates: [editContent],
-          currentIndex: 0,
-          childrenIds: [],
-          branchId: uuid()
-      };
+  const handleSaveEdit = (id: string) => {
+      setMessages(prev => prev.map(msg => {
+          if (msg.id !== id) return msg;
+          
+          const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+          const currentIndex = msg.currentIndex || 0;
+          candidates[currentIndex] = editContent;
 
-      setMessages(prev => {
-          const updated = [...prev, newMsg];
-          if (originalMsg.parentId) {
-              const parentIndex = updated.findIndex(m => m.id === originalMsg.parentId);
-              if (parentIndex !== -1) {
-                  updated[parentIndex] = {
-                      ...updated[parentIndex],
-                      childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                  };
-              }
-          }
-          return updated;
-      });
-      
-      setCurrentNodeId(newId);
-      setEditingIndex(null);
+          return {
+              ...msg,
+              candidates,
+              content: editContent
+          };
+      }));
+      setEditingId(null);
       setEditContent('');
   };
 
-  const handleRegenerate = async (index: number) => {
-      if (isLoading || !character) return;
+  const handleRegenerate = async (id: string) => {
+      if (isLoadingRef.current || !character) return;
       
-      const activePath = currentNodeId ? getBranchPath(messages, currentNodeId) : [];
-      const originalMsg = activePath[index];
-      if (!originalMsg || originalMsg.role !== 'model') return;
-
-      const historyContext = activePath.slice(0, index);
+      const index = messages.findIndex(m => m.id === id);
+      if (index === -1 || messages[index].role !== 'model') return;
 
       setIsLoading(true);
+      isLoadingRef.current = true;
       try {
           let lastUserMsg = "";
           const contextForGen: Message[] = [];
           
           if (index > 0) {
-             const prevMsg = activePath[index - 1];
+             const prevMsg = messages[index - 1];
              if (prevMsg.role === 'user') {
                  lastUserMsg = prevMsg.candidates?.[prevMsg.currentIndex || 0] || prevMsg.content;
-                 contextForGen.push(...activePath.slice(0, index - 1));
-                 contextForGen.push({...prevMsg, content: lastUserMsg});
+                 contextForGen.push(...messages.slice(0, index - 1));
              } else {
-                 contextForGen.push(...activePath.slice(0, index));
+                 contextForGen.push(...messages.slice(0, index));
              }
           }
 
-          const replyRaw = await generateReply(contextForGen, lastUserMsg, character, settings);
-          const { content, thought } = parseThoughtAndContent(replyRaw);
+          const { content: replyContent, activeLoreIds } = await generateReply(contextForGen, lastUserMsg, character, settings);
+          const { content, thought } = parseThoughtAndContent(replyContent);
           
-          const newId = uuid();
-          const newMsg: Message = {
-              ...originalMsg,
-              id: newId,
-              content: content,
-              thought: thought,
-              candidates: [content],
-              thoughts: [thought],
-              currentIndex: 0,
-              childrenIds: [],
-              branchId: uuid()
-          };
-
           setMessages(prev => {
-              const updated = [...prev, newMsg];
-              if (originalMsg.parentId) {
-                  const parentIndex = updated.findIndex(m => m.id === originalMsg.parentId);
-                  if (parentIndex !== -1) {
-                      updated[parentIndex] = {
-                          ...updated[parentIndex],
-                          childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                      };
-                  }
-              }
-              return updated;
+              const newMsgs = prev.map(msg => {
+                  if (msg.id !== id) return msg;
+                  
+                  const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+                  const thoughts = msg.thoughts ? [...msg.thoughts] : [msg.thought || ''];
+                  
+                  candidates.push(content);
+                  thoughts.push(thought);
+                  
+                  return {
+                      ...msg,
+                      candidates,
+                      thoughts,
+                      currentIndex: candidates.length - 1,
+                      content,
+                      thought,
+                      activeLoreIds: activeLoreIds
+                  };
+              });
+              return newMsgs;
           });
-          setCurrentNodeId(newId);
       } catch (e: any) {
-           // Improved Error Handling for Regenerate
            const errorMsg = `[SYSTEM ERROR]: ${e.message || 'Gagal regenerasi respon.'}`;
-           const newId = uuid();
-           const newMsg: Message = {
-               ...originalMsg,
-               id: newId,
-               content: errorMsg,
-               candidates: [errorMsg],
-               currentIndex: 0,
-               childrenIds: [],
-               branchId: 'error'
-           };
-
-           setMessages(prev => {
-               const updated = [...prev, newMsg];
-               if (originalMsg.parentId) {
-                   const parentIndex = updated.findIndex(m => m.id === originalMsg.parentId);
-                   if (parentIndex !== -1) {
-                       updated[parentIndex] = {
-                           ...updated[parentIndex],
-                           childrenIds: [...(updated[parentIndex].childrenIds || []), newId]
-                       };
-                   }
-               }
-               return updated;
-           });
-           setCurrentNodeId(newId);
+           setMessages(prev => prev.map(msg => {
+              if (msg.id !== id) return msg;
+              
+              const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+              candidates.push(errorMsg);
+              
+              return {
+                  ...msg,
+                  candidates,
+                  currentIndex: candidates.length - 1,
+                  content: errorMsg
+              };
+          }));
       } finally {
           setIsLoading(false);
+          isLoadingRef.current = false;
       }
   };
 
@@ -698,7 +567,7 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
                         <div className="grid grid-cols-3 gap-3">
                             <div className="relative group col-span-1">
                                 <button onClick={() => fileInputRef.current?.click()} className="w-full bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 py-3 rounded-xl text-sm font-medium transition flex flex-col items-center justify-center gap-1 h-full min-h-[80px]"><i className="fas fa-file-import text-lg"></i><span>Impor</span></button>
-                                <input type="file" ref={fileInputRef} onChange={handleImportChat} accept=".txt,.json,.jsonl" className="hidden" />
+                                <input type="file" ref={fileInputRef} onChange={handleImportChat} accept=".json,.jsonl,.txt,application/json,text/plain,*/*" className="hidden" />
                             </div>
                              <div className="relative group col-span-1">
                                 <button className="w-full bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 py-3 rounded-xl text-sm font-medium transition flex flex-col items-center justify-center gap-1 h-full min-h-[80px]"><i className="fas fa-download text-lg"></i><span>Unduh</span></button>
@@ -739,15 +608,22 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
         </div>
 
         <div className="flex items-center gap-2 relative">
-            {/* View Mode Toggle */}
-            <button 
-                onClick={() => setViewMode(viewMode === 'chat' ? 'tree' : 'chat')}
-                className={`text-sm px-3 py-1.5 rounded-lg font-medium transition flex items-center gap-2 ${viewMode === 'tree' ? 'bg-primary-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
-                title={viewMode === 'chat' ? "Lihat Pohon Obrolan" : "Kembali ke Chat"}
-            >
-                <i className={`fas ${viewMode === 'chat' ? 'fa-project-diagram' : 'fa-comments'}`}></i>
-                <span className="hidden sm:inline">{viewMode === 'chat' ? 'Tree View' : 'Chat View'}</span>
-            </button>
+            {/* Suggested Lore Magic Button (If any) */}
+            {suggestedLores.length > 0 && (
+                <button 
+                  onClick={() => setShowSuggestedLoreModal(true)}
+                  className="relative group p-2 bg-amber-500/20 text-amber-500 rounded-lg animate-pulse hover:animate-none transition"
+                  title="Ada saran lore baru!"
+                >
+                    <i className="fas fa-magic"></i>
+                    <span className="absolute -top-1 -right-1 bg-white text-amber-600 text-[8px] font-black w-4 h-4 flex items-center justify-center rounded-full border border-amber-500">
+                        {suggestedLores.length}
+                    </span>
+                    <div className="absolute top-full right-0 mt-2 p-2 bg-amber-600 text-white text-[10px] rounded-md opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none z-50 font-bold shadow-xl">
+                       Tinjau saran lore baru ({suggestedLores.length})
+                    </div>
+                </button>
+            )}
 
             {/* Lorebook Toggle Button */}
             <button 
@@ -784,212 +660,466 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
         </div>
       </header>
 
-      {/* Main Content Area */}
-      {viewMode === 'tree' ? (
-        <div className="flex-1 p-4 overflow-hidden">
-            <ChatTree 
-                messages={messages} 
-                currentNodeId={currentNodeId} 
-                onNodeSelect={(id) => {
-                    setCurrentNodeId(id);
-                    setViewMode('chat');
-                }} 
-            />
-        </div>
-      ) : (
-        <>
-          {/* Messages Area */}
-          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar">
-            {currentNodeId ? getBranchPath(messages, currentNodeId).map((msg, idx) => {
-                const isUser = msg.role === 'user';
-                const candidates = msg.candidates || [msg.content];
-                const currentIdx = msg.currentIndex || 0;
-                const activeContent = candidates[currentIdx];
-                const isEditing = editingIndex === idx;
-                const isError = activeContent.startsWith('[SYSTEM ERROR]:');
+      {/* Messages Area */}
+      <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar">
+        {messages.map((msg, idx) => {
+            const isUser = msg.role === 'user';
+            const candidates = msg.candidates || [msg.content];
+            const currentIdx = msg.currentIndex || 0;
+            const activeContent = candidates[currentIdx];
+            const isEditing = editingId === msg.id;
+            const isError = activeContent.startsWith('[SYSTEM ERROR]:');
 
-                // Render Formatting Logic (Improved)
-                const renderContent = (text: string) => {
-                    // Split paragraphs first
-                    return text.split('\n').map((line, i) => (
-                        <p key={i} className="mb-2 min-h-[1rem] whitespace-pre-wrap">
-                            {/* Split by Bold (**) and Italic (*) delimiters, keeping delimiters in result */}
-                            {line.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g).map((part, j) => {
-                                if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
-                                    // Bold: **Text**
-                                    return <span key={j} className="text-white font-bold">{part.slice(2, -2)}</span>;
-                                } else if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
-                                    // Italic: *Text*
-                                    return <span key={j} className="text-gray-400 italic">{part.slice(1, -1)}</span>;
-                                } else {
-                                    // Normal Dialog: Text
-                                    return <span key={j} className="text-gray-200">{part}</span>;
-                                }
-                            })}
-                        </p>
-                    ));
+            // Render Formatting Logic (Improved to support <details> and <font>)
+            const renderTextNodes = (text: string, isInline: boolean = false): React.ReactNode => {
+                // Match <font color="...">...</font> supporting single or double quotes
+                const fontRegex = /(<font\s+color=["'][^"']+["']>[\s\S]*?<\/font>)/gi;
+                const fontParts = text.split(fontRegex);
+
+                const renderInline = (inlineText: string) => {
+                    const inlineRegex = /(\*\*[\s\S]+?\*\*|\*[\s\S]+?\*)/g;
+                    const parts = inlineText.split(inlineRegex);
+                    return parts.map((part, i) => {
+                        if (!part) return null;
+                        if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+                            return <span key={i} className="text-white font-bold">{part.slice(2, -2)}</span>;
+                        } else if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+                            return <span key={i} className="text-gray-400 italic">{part.slice(1, -1)}</span>;
+                        } else {
+                            return <span key={i}>{part}</span>;
+                        }
+                    });
                 };
 
-                return (
-                    <div key={msg.id} className={`flex w-full group ${isUser ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`flex flex-col max-w-[90%] md:max-w-[75%] ${isUser ? 'items-end' : 'items-start'}`}>
+                return fontParts.map((part, index) => {
+                    if (!part) return null;
+                    if (part.toLowerCase().startsWith('<font')) {
+                        const colorMatch = part.match(/color=["']([^"']+)["']/i);
+                        const color = colorMatch ? colorMatch[1] : 'inherit';
+                        const content = part.replace(/<font[^>]*>([\s\S]*?)<\/font>/i, '$1');
+                        
+                        return (
+                            <span key={index} style={{ color }}>
+                                {renderTextNodes(content, true)}
+                            </span>
+                        );
+                    } else {
+                        if (isInline) {
+                            return part.split('\n').map((line, i) => (
+                                <React.Fragment key={i}>
+                                    {i > 0 && <br />}
+                                    {renderInline(line)}
+                                </React.Fragment>
+                            ));
+                        } else {
+                            return part.split('\n').map((line, i) => (
+                                <p key={i} className="mb-2 min-h-[1rem] whitespace-pre-wrap text-gray-200">
+                                    {renderInline(line)}
+                                </p>
+                            ));
+                        }
+                    }
+                });
+            };
+
+            const renderContent = (text: string) => {
+                const parts: { type: string, content?: string, summary?: string, body?: string, html?: string }[] = [];
+                
+                // Regex to find <!-- GFX_START -->...<!-- GFX_END --> blocks containing raw HTML
+                const gfxRegex = /<!--\s*GFX_START\s*-->([\s\S]*?)<!--\s*GFX_END\s*-->/gi;
+                
+                // Regex to find standard <details> blocks
+                const detailsRegex = /<details>([\s\S]*?)<\/details>/gi;
+                
+                let remainingText = text;
+                
+                // 1. First Pass: Extract GFX/HTML Blocks
+                let match;
+                while ((match = gfxRegex.exec(remainingText)) !== null) {
+                    const before = remainingText.substring(0, match.index);
+                    if (before.trim()) parts.push({ type: 'text_chunk', content: before });
+                    
+                    parts.push({ type: 'html', html: match[1].trim() });
+                    
+                    remainingText = remainingText.substring(gfxRegex.lastIndex);
+                    gfxRegex.lastIndex = 0; // Reset index since we modified the string
+                }
+                
+                if (remainingText.trim()) parts.push({ type: 'text_chunk', content: remainingText });
+                
+                // 2. Second Pass: Process <details> tags inside the remaining text chunks
+                const finalParts: { type: string, content?: string, summary?: string, body?: string, html?: string }[] = [];
+                
+                for (let i = 0; i < parts.length; i++) {
+                    const chunk = parts[i];
+                    if (chunk.type === 'text_chunk') {
+                        let innerText = chunk.content || "";
+                        let detailsMatch;
+                        let lastIdx = 0;
+                        
+                        while ((detailsMatch = detailsRegex.exec(innerText)) !== null) {
+                            if (detailsMatch.index > lastIdx) {
+                                finalParts.push({ type: 'text', content: innerText.substring(lastIdx, detailsMatch.index) });
+                            }
                             
-                            <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
-                                {/* Avatar */}
-                                <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
-                                    {isUser ? (
-                                        <div className="w-full h-full bg-gray-700 flex items-center justify-center text-xs text-gray-300">
-                                            <i className="fas fa-user"></i>
-                                        </div>
-                                    ) : (
-                                        <img src={character.avatarUrl} className="w-full h-full object-cover" />
-                                    )}
+                            const detailsContent = detailsMatch[1];
+                            const summaryMatch = /<summary>([\s\S]*?)<\/summary>/i.exec(detailsContent);
+                            const summary = summaryMatch ? summaryMatch[1].trim() : 'Details';
+                            const body = detailsContent.replace(/<summary>[\s\S]*?<\/summary>/i, '').trim();
+                            
+                            finalParts.push({ type: 'details', summary, body });
+                            lastIdx = detailsRegex.lastIndex;
+                        }
+                        
+                        if (lastIdx < innerText.length) {
+                           finalParts.push({ type: 'text', content: innerText.substring(lastIdx) });
+                        }
+                        detailsRegex.lastIndex = 0;
+                    } else {
+                        // It's an HTML chunk, just push it directly
+                        finalParts.push(chunk);
+                    }
+                }
+
+                return finalParts.map((part, index) => {
+                    if (part.type === 'html') {
+                        return (
+                            <div key={index} className="my-4" dangerouslySetInnerHTML={{ __html: part.html || '' }} />
+                        );
+                    } else if (part.type === 'details') {
+                        return (
+                            <details key={index} className="my-3 bg-black/30 rounded-lg border border-gray-700/50 overflow-hidden shadow-inner">
+                                <summary className="cursor-pointer px-4 py-2 bg-gray-800/80 hover:bg-gray-700 font-bold text-gray-300 select-none outline-none flex items-center transition-colors">
+                                    <span className="flex-1">{part.summary}</span>
+                                </summary>
+                                <div className="p-4 text-sm text-gray-300 border-t border-gray-700/50">
+                                    {renderTextNodes(part.body || '')}
                                 </div>
+                            </details>
+                        );
+                    } else {
+                        return <div key={index}>{renderTextNodes(part.content || '')}</div>;
+                    }
+                });
+            };
 
-                                <div className="flex flex-col">
-                                    {/* THOUGHT PROCESS BUBBLE */}
-                                    {!isUser && msg.thought && (
-                                        <div className="mb-2 max-w-full bg-gray-900/80 border border-gray-700/50 rounded-xl overflow-hidden shadow-sm animate-fade-in self-start w-full">
-                                            <div 
-                                                onClick={() => toggleThought(msg.id)}
-                                                className="px-3 py-2 bg-gray-800/50 flex items-center justify-between cursor-pointer hover:bg-gray-800 transition"
-                                            >
-                                                <div className="flex items-center gap-2 text-xs font-bold text-gray-400">
-                                                    <i className="fas fa-brain text-primary-500"></i>
-                                                    Thought Process
-                                                </div>
-                                                <button className="text-gray-500 hover:text-white transition">
-                                                    {msg.isThoughtExpanded ? <i className="fas fa-chevron-up"></i> : <i className="fas fa-chevron-down"></i>}
-                                                </button>
-                                            </div>
-                                            {msg.isThoughtExpanded && (
-                                                <div className="p-3 text-xs text-gray-400 font-mono italic leading-relaxed border-t border-gray-700/30 whitespace-pre-wrap bg-gray-950/30">
-                                                    {msg.thought}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
-
-                                    {/* Message Bubble */}
-                                    <div className={`
-                                        relative px-5 py-3 rounded-2xl text-sm md:text-base leading-relaxed shadow-md whitespace-pre-wrap min-w-[120px]
-                                        ${isError 
-                                            ? 'bg-red-900/50 border border-red-500 text-red-100 rounded-tl-none'
-                                            : (isUser 
-                                                ? 'bg-primary-600 text-white rounded-tr-none' 
-                                                : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-tl-none')
-                                        }
-                                    `}>
-                                        {isEditing ? (
-                                            <div className="w-full min-w-[200px]">
-                                                <textarea 
-                                                    value={editContent}
-                                                    onChange={(e) => setEditContent(e.target.value)}
-                                                    className="w-full bg-black/20 text-white rounded p-2 text-sm outline-none border border-white/20"
-                                                    rows={Math.max(3, editContent.split('\n').length)}
-                                                />
-                                                <div className="flex justify-end gap-2 mt-2">
-                                                    <button onClick={() => setEditingIndex(null)} className="px-3 py-1 bg-gray-700 rounded hover:bg-gray-600 text-xs">Batal</button>
-                                                    <button onClick={() => handleSaveEdit(idx)} className="px-3 py-1 bg-green-600 rounded hover:bg-green-500 text-white text-xs">Simpan</button>
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            renderContent(activeContent)
-                                        )}
+            return (
+                <div key={msg.id} className={`flex w-full group ${isUser ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`flex flex-col max-w-[90%] md:max-w-[75%] ${isUser ? 'items-end' : 'items-start'}`}>
+                        
+                        <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+                            {/* Avatar */}
+                            <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
+                                {isUser ? (
+                                    <div className="w-full h-full bg-gray-700 flex items-center justify-center text-xs text-gray-300">
+                                        <i className="fas fa-user"></i>
                                     </div>
-                                </div>
+                                ) : (
+                                    <img src={character.avatarUrl} className="w-full h-full object-cover" />
+                                )}
                             </div>
 
-                            {/* Message Controls (Bottom of bubble) */}
-                            {showAdvancedControls && !isEditing && !isError && (
-                                <div className={`flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity ${isUser ? 'pr-12' : 'pl-12'}`}>
-                                    
-                                    {/* Branch Navigation */}
-                                    {candidates.length > 1 && (
-                                        <div className="flex items-center bg-gray-800 rounded-md px-1 border border-gray-700">
-                                            <button onClick={() => handleSwipe(idx, 'left')} className="p-1 hover:text-white"><i className="fas fa-chevron-left"></i></button>
-                                            <span className="mx-2 font-mono">{currentIdx + 1}/{candidates.length}</span>
-                                            <button onClick={() => handleSwipe(idx, 'right')} className="p-1 hover:text-white"><i className="fas fa-chevron-right"></i></button>
+                            <div className="flex flex-col">
+                                {/* THOUGHT PROCESS BUBBLE */}
+                                {!isUser && msg.thought && (
+                                    <div className="mb-2 max-w-full bg-gray-900/80 border border-gray-700/50 rounded-xl overflow-hidden shadow-sm animate-fade-in self-start w-full">
+                                        <div 
+                                            onClick={() => toggleThought(msg.id)}
+                                            className="px-3 py-2 bg-gray-800/50 flex items-center justify-between cursor-pointer hover:bg-gray-800 transition"
+                                        >
+                                            <div className="flex items-center gap-2 text-xs font-bold text-gray-400">
+                                                <i className="fas fa-brain text-primary-500"></i>
+                                                Thought Process
+                                            </div>
+                                            <button className="text-gray-500 hover:text-white transition">
+                                                {msg.isThoughtExpanded ? <i className="fas fa-chevron-up"></i> : <i className="fas fa-chevron-down"></i>}
+                                            </button>
                                         </div>
+                                        {msg.isThoughtExpanded && (
+                                            <div className="p-3 text-xs text-gray-400 font-mono italic leading-relaxed border-t border-gray-700/30 whitespace-pre-wrap bg-gray-950/30">
+                                                {msg.thought}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Message Bubble */}
+                                <div className={`
+                                    relative px-5 py-3 rounded-2xl text-sm md:text-base leading-relaxed shadow-md whitespace-pre-wrap min-w-[120px]
+                                    ${isError 
+                                        ? 'bg-red-900/50 border border-red-500 text-red-100 rounded-tl-none'
+                                        : (isUser 
+                                            ? 'bg-primary-600 text-white rounded-tr-none' 
+                                            : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-tl-none')
+                                    }
+                                `}>
+                                {isEditing ? (
+                                        <div className="w-full min-w-[200px]">
+                                            <textarea 
+                                                value={editContent}
+                                                onChange={(e) => setEditContent(e.target.value)}
+                                                className="w-full bg-black/20 text-white rounded p-2 text-sm outline-none border border-white/20"
+                                                rows={Math.max(3, editContent.split('\n').length)}
+                                            />
+                                            <div className="flex justify-end gap-2 mt-2">
+                                                <button onClick={() => setEditingId(null)} className="px-3 py-1 bg-gray-700 rounded hover:bg-gray-600 text-xs text-gray-300">Batal</button>
+                                                <button onClick={() => handleSaveEdit(msg.id)} className="px-3 py-1 bg-green-600 rounded hover:bg-green-500 text-white text-xs">Simpan</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {renderContent(activeContent)}
+                                            {!isUser && msg.activeLoreIds && msg.activeLoreIds.length > 0 && (
+                                                <div className={`mt-3 pt-2 border-t border-gray-700/50 flex flex-wrap gap-2 transition-all duration-300 ${visibleLoreMsgId === msg.id ? 'opacity-100 max-h-40 overflow-y-auto' : 'opacity-0 max-h-0 overflow-hidden'}`}>
+                                                    {msg.activeLoreIds.map(loreId => {
+                                                        const lore = character.lorebook?.find(l => l.id === loreId);
+                                                        if (!lore) return null;
+                                                        return (
+                                                            <div key={loreId} className="text-[10px] bg-amber-500/10 text-amber-500/80 px-2 py-1 rounded border border-amber-500/20 italic">
+                                                                <i className="fas fa-bookmark mr-1"></i> {lore.keys[0]}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Message Controls (Bottom of bubble) */}
+                        {showAdvancedControls && !isEditing && !isError && (
+                            <div className={`flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity ${isUser ? 'pr-12' : 'pl-12'}`}>
+                                
+                                {/* Branch Navigation */}
+                                {candidates.length > 1 && (
+                                    <div className="flex items-center bg-gray-800 rounded-md px-1 border border-gray-700">
+                                        <button onClick={() => handleSwipe(msg.id, 'left')} className="p-1 hover:text-white"><i className="fas fa-chevron-left"></i></button>
+                                        <span className="mx-2 font-mono">{currentIdx + 1}/{candidates.length}</span>
+                                        <button onClick={() => handleSwipe(msg.id, 'right')} className="p-1 hover:text-white"><i className="fas fa-chevron-right"></i></button>
+                                    </div>
+                                )}
+
+                                {/* Action Buttons */}
+                                <div className="flex items-center gap-1 bg-gray-800/50 rounded-md p-1">
+                                    {!isUser && msg.activeLoreIds && msg.activeLoreIds.length > 0 && (
+                                        <button 
+                                            onClick={() => setVisibleLoreMsgId(msg.id === visibleLoreMsgId ? null : msg.id)}
+                                            className={`p-1.5 transition ${msg.id === visibleLoreMsgId ? 'text-amber-400' : 'hover:text-amber-400'}`} 
+                                            title="Tampilkan Lorebook Aktif"
+                                        >
+                                            <i className="fas fa-book-sparkles text-[13px]"></i>
+                                            <span className="ml-1 text-[9px] bg-amber-500/20 text-amber-500 rounded-full px-1">{msg.activeLoreIds.length}</span>
+                                        </button>
+                                    )}
+                                    <button onClick={() => handleStartEdit(msg.id)} className="p-1.5 hover:text-primary-400 transition" title="Edit Pesan">
+                                        <i className="fas fa-pen"></i>
+                                    </button>
+                                    
+                                    {!isUser && (
+                                         <button onClick={() => handleRegenerate(msg.id)} className="p-1.5 hover:text-green-400 transition" title="Buat Ulang Jawaban">
+                                            <i className="fas fa-sync-alt"></i>
+                                        </button>
                                     )}
 
-                                    {/* Action Buttons */}
-                                    <div className="flex items-center gap-1 bg-gray-800/50 rounded-md p-1">
-                                        <button onClick={() => handleStartEdit(idx)} className="p-1.5 hover:text-primary-400 transition" title="Edit Pesan">
-                                            <i className="fas fa-pen"></i>
-                                        </button>
-                                        
-                                        {!isUser && (
-                                             <button onClick={() => handleRegenerate(idx)} className="p-1.5 hover:text-green-400 transition" title="Buat Ulang Jawaban">
-                                                <i className="fas fa-sync-alt"></i>
-                                            </button>
-                                        )}
+                                    <button onClick={() => requestDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition" title="Hapus Pesan">
+                                        <i className="fas fa-trash"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                        {/* Error Message Delete only */}
+                        {isError && (
+                             <div className="flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity pl-12">
+                                <button onClick={() => requestDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition bg-gray-800/50 rounded-md" title="Hapus Pesan Error">
+                                    <i className="fas fa-trash"></i>
+                                </button>
+                             </div>
+                        )}
 
-                                        <button onClick={() => handleDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition" title="Hapus Pesan">
-                                            <i className="fas fa-trash"></i>
+                    </div>
+                </div>
+            );
+        })}
+        
+        {isLoading && (
+             <div className="flex w-full justify-start">
+                 <div className="flex max-w-[85%] gap-3">
+                    <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
+                        <img src={character.avatarUrl} className="w-full h-full object-cover" />
+                    </div>
+                    <div className="bg-gray-800 border border-gray-700 px-5 py-4 rounded-2xl rounded-tl-none flex items-center gap-2">
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-100"></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-200"></div>
+                    </div>
+                 </div>
+             </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="p-4 bg-gray-950 border-t border-gray-800 shrink-0">
+        <div className="max-w-4xl mx-auto relative">
+            <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                    }
+                }}
+                disabled={isLoading}
+                placeholder={`Kirim pesan ke ${character.name}...`}
+                className="w-full bg-gray-900 text-white rounded-xl border border-gray-700 p-4 pr-14 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none resize-none shadow-inner h-[80px] custom-scrollbar" 
+            />
+            <button 
+                onClick={handleSendMessage}
+                disabled={isLoading || !input.trim()}
+                className="absolute right-3 bottom-3 p-2 bg-primary-600 hover:bg-primary-500 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded-lg transition-all shadow-lg"
+            >
+                <i className="fas fa-paper-plane"></i>
+            </button>
+        </div>
+        <p className="text-center text-xs text-gray-600 mt-2">
+            AI dapat membuat kesalahan. Periksa informasi penting.
+        </p>
+      </div>
+
+      {/* NEW LORE NOTIFICATION (Smart Discovery) */}
+      {newLoreNotification && (
+          <div className="fixed top-20 right-4 z-50 animate-fade-in-left">
+              <div 
+                className="bg-amber-600 hover:bg-amber-500 text-white px-5 py-4 rounded-2xl shadow-2xl flex items-center gap-4 border border-amber-400/30 cursor-pointer transition transform hover:scale-105 active:scale-95"
+                onClick={() => { setShowSuggestedLoreModal(true); setNewLoreNotification(false); }}
+              >
+                  <div className="bg-white/20 p-2 rounded-xl">
+                      <i className="fas fa-magic text-lg"></i>
+                  </div>
+                  <div>
+                      <h4 className="font-bold text-sm tracking-tight text-white/90">Wawasan Baru Teridentifikasi ✨</h4>
+                      <p className="text-[10px] text-white/80 leading-tight">Klik untuk meninjau dan menambahkan ke Lorebook.</p>
+                  </div>
+                  <div className="ml-2 bg-amber-800/40 w-6 h-6 flex items-center justify-center rounded-full text-[10px] font-bold">
+                    {suggestedLores.length}
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* SUGGESTED LORE MODAL */}
+      {showSuggestedLoreModal && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in" onClick={() => setShowSuggestedLoreModal(false)}>
+              <div className="bg-gray-900 border border-amber-500/30 rounded-3xl w-full max-w-xl shadow-2xl overflow-hidden animate-bounce-in flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
+                    <div className="bg-amber-500/10 px-8 py-5 border-b border-amber-500/20 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="bg-amber-500/20 p-2 rounded-lg text-amber-500">
+                                <i className="fas fa-magic"></i>
+                            </div>
+                            <h3 className="text-amber-400 font-bold uppercase tracking-widest text-sm">
+                                Tinjau Lore Baru
+                            </h3>
+                        </div>
+                        <button onClick={() => setShowSuggestedLoreModal(false)} className="text-gray-400 hover:text-white transition p-2">
+                            <i className="fas fa-times"></i>
+                        </button>
+                    </div>
+                    
+                    <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-4">
+                        {suggestedLores.length === 0 ? (
+                            <div className="text-center py-10">
+                                <i className="fas fa-check-circle text-4xl text-gray-700 mb-4"></i>
+                                <p className="text-gray-500">Semua wawasan telah ditinjau.</p>
+                            </div>
+                        ) : (
+                            suggestedLores.map((lore, index) => (
+                                <div key={lore.id} className="bg-gray-850 p-5 rounded-2xl border border-gray-800 hover:border-amber-500/20 transition group">
+                                    <div className="flex flex-wrap gap-2 mb-3">
+                                        {lore.keys.map((k, i) => (
+                                            <span key={i} className="text-[10px] font-bold bg-amber-500/10 text-amber-500 px-2.5 py-1 rounded-lg border border-amber-500/20 uppercase tracking-tighter">
+                                                {k}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    <p className="text-sm text-gray-300 leading-relaxed mb-4 italic pl-4 border-l-2 border-amber-500/20">
+                                        "{lore.entry}"
+                                    </p>
+                                    <div className="flex justify-end gap-2">
+                                        <button 
+                                            onClick={() => setSuggestedLores(prev => prev.filter(l => l.id !== lore.id))}
+                                            className="px-4 py-2 text-xs font-bold text-gray-500 hover:text-red-400 transition"
+                                        >
+                                            Abaikan
+                                        </button>
+                                        <button 
+                                            onClick={async () => {
+                                                const updatedEntries = [...(character?.lorebook || []), lore];
+                                                await handleSaveLorebook(updatedEntries);
+                                                setSuggestedLores(prev => prev.filter(l => l.id !== lore.id));
+                                            }}
+                                            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/20 flex items-center gap-2"
+                                        >
+                                            <i className="fas fa-plus"></i> Tambah ke Lorebook
                                         </button>
                                     </div>
                                 </div>
-                            )}
-                            {/* Error Message Delete only */}
-                            {isError && (
-                                 <div className="flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity pl-12">
-                                    <button onClick={() => handleDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition bg-gray-800/50 rounded-md" title="Hapus Pesan Error">
-                                        <i className="fas fa-trash"></i>
-                                    </button>
-                                 </div>
-                            )}
-
-                        </div>
+                            ))
+                        )}
                     </div>
-                );
-            }) : null}
-            
-            {isLoading && (
-                 <div className="flex w-full justify-start">
-                     <div className="flex max-w-[85%] gap-3">
-                        <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
-                            <img src={character.avatarUrl} className="w-full h-full object-cover" />
-                        </div>
-                        <div className="bg-gray-800 border border-gray-700 px-5 py-4 rounded-2xl rounded-tl-none flex items-center gap-2">
-                            <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
-                            <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-100"></div>
-                            <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-200"></div>
-                        </div>
-                     </div>
-                 </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
 
-          <div className="p-4 bg-gray-950 border-t border-gray-800 shrink-0">
-            <div className="max-w-4xl mx-auto relative">
-                <textarea
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) {
-                            e.preventDefault();
-                            handleSendMessage();
-                        }
-                    }}
-                    disabled={isLoading}
-                    placeholder={`Kirim pesan ke ${character.name}...`}
-                    className="w-full bg-gray-900 text-white rounded-xl border border-gray-700 p-4 pr-14 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none resize-none shadow-inner h-[80px] custom-scrollbar" 
-                />
-                <button 
-                    onClick={() => handleSendMessage()}
-                    disabled={isLoading || !input.trim()}
-                    className="absolute right-3 bottom-3 p-2 bg-primary-600 hover:bg-primary-500 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded-lg transition-all shadow-lg"
-                >
-                    <i className="fas fa-paper-plane"></i>
-                </button>
-            </div>
-            <p className="text-center text-xs text-gray-600 mt-2">
-                AI dapat membuat kesalahan. Periksa informasi penting.
-            </p>
+                    <div className="bg-gray-800/30 p-6 border-t border-gray-800 flex justify-between items-center">
+                        <p className="text-xs text-gray-500">AI mendeteksi fakta baru berdasarkan perkembangan cerita.</p>
+                        <button onClick={() => setShowSuggestedLoreModal(false)} className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-xs font-bold text-gray-300 transition">
+                            Tutup
+                        </button>
+                    </div>
+              </div>
           </div>
-        </>
+      )}
+
+      {/* LORE ACTIVITY TRACKER MODAL (SillyTavern style) */}
+      {visibleLoreMsgId && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in" onClick={() => setVisibleLoreMsgId(null)}>
+              <div className="bg-gray-900 border border-amber-500/30 rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden animate-bounce-in" onClick={e => e.stopPropagation()}>
+                   <div className="bg-amber-500/10 px-6 py-4 border-b border-amber-500/20 flex items-center justify-between">
+                       <h3 className="text-amber-400 font-bold uppercase tracking-wider flex items-center gap-2">
+                           <i className="fas fa-book-sparkles"></i>
+                           Lore Terdeteksi untuk Pesan Ini
+                       </h3>
+                       <button onClick={() => setVisibleLoreMsgId(null)} className="text-gray-400 hover:text-white transition p-2">
+                           <i className="fas fa-times"></i>
+                       </button>
+                   </div>
+                   <div className="max-h-[60vh] overflow-y-auto custom-scrollbar p-6 space-y-4">
+                       {messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds?.map(loreId => {
+                           const lore = character.lorebook?.find(l => l.id === loreId);
+                           if (!lore) return null;
+                           return (
+                               <div key={loreId} className="bg-gray-850 p-4 rounded-xl border border-gray-800 hover:border-amber-500/30 transition shadow-inner">
+                                   <div className="flex flex-wrap gap-1.5 mb-3">
+                                       {lore.keys.map((k, ki) => (
+                                           <span key={ki} className="text-[9px] font-bold bg-primary-500/20 text-primary-400 px-2 py-0.5 rounded border border-primary-500/30 uppercase">
+                                               {k}
+                                           </span>
+                                       ))}
+                                   </div>
+                                   <p className="text-sm text-gray-300 leading-relaxed italic border-l-2 border-amber-500/30 pl-3">"{lore.entry}"</p>
+                               </div>
+                           );
+                       })}
+                       {(!messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds || messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds?.length === 0) && (
+                           <div className="text-center py-10 text-gray-500">Tidak ada lore yang aktif untuk pesan ini.</div>
+                       )}
+                   </div>
+                   <div className="bg-gray-800/30 p-4 border-t border-gray-800 text-center">
+                        <button onClick={() => setVisibleLoreMsgId(null)} className="px-8 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold text-gray-300 transition border border-gray-700">
+                            Tutup
+                        </button>
+                   </div>
+              </div>
+          </div>
       )}
 
       {/* LOREBOOK MODAL */}
@@ -1010,13 +1140,65 @@ const ChatPage: React.FC<Props> = ({ settings }) => {
           lastCharacterMessage={messages.length > 0 && messages[messages.length - 1].role === 'model' ? messages[messages.length - 1] : null}
       />
 
-      {/* CONFIRMATION MODAL */}
-      <ConfirmModal 
-          isOpen={confirmAction.isOpen}
-          title={confirmAction.title}
-          message={confirmAction.message}
-          onConfirm={confirmAction.onConfirm}
-          onCancel={closeConfirm}
+      {/* MANUAL DOWNLOAD MODAL (FOR MOBILE BROWSER COMPATIBILITY) */}
+      {downloadLink && (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in" onClick={() => setDownloadLink(null)}>
+              <div className="bg-gray-900 border border-primary-500/30 rounded-3xl w-full max-w-sm shadow-2xl overflow-hidden animate-bounce-in flex flex-col" onClick={e => e.stopPropagation()}>
+                    <div className="px-6 py-6 text-center space-y-4">
+                        <div className="w-16 h-16 bg-primary-500/10 text-primary-500 rounded-full flex items-center justify-center mx-auto mb-2 shadow-inner">
+                           <i className="fas fa-file-download text-3xl"></i>
+                        </div>
+                        <h3 className="text-xl font-bold text-white tracking-tight">Unduh Tersedia</h3>
+                        <p className="text-sm text-gray-400">Beberapa sistem mencegah unduhan otomatis. Klik tombol di bawah ini atau salin isinya.</p>
+                        
+                        <a 
+                           href={downloadLink.url} 
+                           download={downloadLink.filename}
+                           className="block w-full py-3.5 bg-primary-600 hover:bg-primary-500 text-white rounded-xl text-sm font-bold shadow-lg shadow-primary-900/20 transition text-center"
+                           onClick={() => setTimeout(() => setDownloadLink(null), 1000)}
+                        >
+                            <i className="fas fa-download mr-2"></i> Ketuk Untuk Mengunduh
+                        </a>
+
+                        <button 
+                            onClick={async () => {
+                                try {
+                                    await navigator.clipboard.writeText(downloadLink.content);
+                                    alert("Isi chat berhasil disalin ke clipboard!");
+                                    setDownloadLink(null);
+                                } catch (e) {
+                                    alert("Gagal menyalin. Silakan unduh file secara manual.");
+                                }
+                            }}
+                            className="block w-full py-3 border border-gray-700 bg-gray-800 hover:bg-gray-750 text-white text-sm rounded-xl font-bold transition text-center mt-2 group"
+                        >
+                            <i className="fas fa-copy mr-2 text-gray-400 group-hover:text-white transition"></i> Salin sebagai Teks
+                        </button>
+                    </div>
+                    
+                    <div className="bg-gray-800/30 p-4 border-t border-gray-800 flex justify-center items-center relative">
+                        <button onClick={() => setDownloadLink(null)} className="px-6 py-2.5 bg-transparent hover:bg-gray-800 rounded-xl text-sm font-medium text-gray-400 transition w-full">
+                            Batal
+                        </button>
+                    </div>
+              </div>
+          </div>
+      )}
+
+      <ConfirmModal
+          isOpen={showResetConfirm}
+          title="Hapus Riwayat Chat"
+          message="Hapus semua riwayat chat dengan karakter ini? Tindakan ini tidak dapat dibatalkan."
+          onConfirm={() => handleResetChat(true)}
+          onCancel={() => setShowResetConfirm(false)}
+      />
+
+      <ConfirmModal
+          isOpen={!!msgToDelete}
+          title="Hapus Pesan"
+          message="Hapus pesan ini? Tindakan ini tidak dapat dibatalkan."
+          onConfirm={confirmDeleteMessage}
+          onCancel={() => setMsgToDelete(null)}
       />
     </div>
   );

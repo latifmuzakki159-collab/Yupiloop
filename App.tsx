@@ -8,6 +8,7 @@ import CharacterCard from './components/CharacterCard';
 import ChatPage from './pages/ChatPage';
 import CharacterCreator from './pages/CharacterCreator';
 import BridgeManager from './components/BridgeManager';
+
 import ConfirmModal from './components/ConfirmModal';
 
 interface LayoutProps {
@@ -64,26 +65,33 @@ const Layout: React.FC<LayoutProps> = ({ children, onOpenSettings }) => {
 
 // Home Page Component (Character List)
 const HomePage = ({ characters, setCharacters }: { characters: Character[], setCharacters: (c: Character[]) => void }) => {
-  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [charToDelete, setCharToDelete] = useState<string | null>(null);
 
-  const handleDeleteClick = (e: React.MouseEvent, id: string) => {
+  const requestDeleteChar = (e: React.MouseEvent, id: string) => {
     e.preventDefault();
     e.stopPropagation();
-    setDeleteId(id);
+    setCharToDelete(id);
   };
 
-  const confirmDelete = async () => {
-    if (deleteId) {
-      const newChars = characters.filter(c => c.id !== deleteId);
+  const confirmDeleteChar = async () => {
+    if (charToDelete) {
+      const newChars = characters.filter(c => c.id !== charToDelete);
       setCharacters(newChars);
       await saveCharacters(newChars);
-      await deleteChat(deleteId);
-      setDeleteId(null);
+      await deleteChat(charToDelete);
+      setCharToDelete(null);
     }
   };
 
   return (
-    <div className="h-full overflow-y-auto p-6 md:p-8 relative">
+    <div className="h-full overflow-y-auto p-6 md:p-8">
+      <ConfirmModal
+        isOpen={!!charToDelete}
+        title="Hapus Karakter"
+        message="Hapus karakter ini beserta semua riwayat chatnya? Tindakan ini tidak dapat dibatalkan."
+        onConfirm={confirmDeleteChar}
+        onCancel={() => setCharToDelete(null)}
+      />
       <header className="mb-8 flex justify-between items-center">
         <div>
           <h1 className="text-3xl font-bold text-white mb-2">Pilih Karakter</h1>
@@ -107,20 +115,12 @@ const HomePage = ({ characters, setCharacters }: { characters: Character[], setC
                <CharacterCard 
                   character={char} 
                   onClick={() => {}} 
-                  onDelete={(e) => handleDeleteClick(e, char.id)}
+                  onDelete={(e) => requestDeleteChar(e, char.id)}
                 />
             </Link>
           ))}
         </div>
       )}
-
-      <ConfirmModal 
-        isOpen={!!deleteId}
-        title="Hapus Karakter"
-        message="Apakah Anda yakin ingin menghapus karakter ini beserta semua riwayat chatnya? Tindakan ini tidak dapat dibatalkan."
-        onConfirm={confirmDelete}
-        onCancel={() => setDeleteId(null)}
-      />
     </div>
   );
 };

@@ -9,17 +9,51 @@ export const parseJSONL = (content: string): Message[] => {
   const lines = content.split('\n');
   const messages: Message[] = [];
   
+  // Custom logic to handle SillyTavern full JSON export vs actual JSON Lines.
+  // Sometimes people upload a pure [] JSON instead of JSONL.
+  try {
+     const asFullJson = JSON.parse(content);
+     if (Array.isArray(asFullJson)) {
+         asFullJson.forEach((obj: any) => {
+              let role: 'user' | 'model' = 'user';
+              if (obj.is_user !== undefined) {
+                  role = obj.is_user ? 'user' : 'model';
+              } else if (obj.role) {
+                  role = obj.role === 'assistant' || obj.role === 'model' ? 'model' : 'user';
+              } else if (obj.name && obj.name !== 'You' && obj.name !== 'User' && obj.name !== 'Anda' && obj.name !== 'Saya') {
+                  role = 'model';
+              }
+              const textContent = obj.mes || obj.content || obj.text;
+     
+              if (textContent) {
+                  messages.push({
+                    id: obj.id || uuid(),
+                    role,
+                    content: textContent,
+                    timestamp: obj.send_date || obj.timestamp || Date.now(),
+                    candidates: [textContent],
+                    currentIndex: 0
+                  });
+              }
+         });
+         return messages;
+     }
+  } catch(e) {
+      // Not a valid full JSON array, fall through to JSONL parsing as before
+  }
+  
   for (const line of lines) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
       let role: 'user' | 'model' = 'user';
-      if (
-        obj.role === 'assistant' || 
-        obj.is_user === false || 
-        obj.name !== 'You' && obj.name !== 'User'
-      ) {
-        role = 'model';
+      
+      if (obj.is_user !== undefined) {
+          role = obj.is_user ? 'user' : 'model';
+      } else if (obj.role) {
+          role = obj.role === 'assistant' || obj.role === 'model' ? 'model' : 'user';
+      } else if (obj.name && obj.name !== 'You' && obj.name !== 'User' && obj.name !== 'Anda' && obj.name !== 'Saya') {
+          role = 'model';
       }
       
       const textContent = obj.mes || obj.content || obj.text;
@@ -62,7 +96,7 @@ export const parseTextChat = (content: string, charName: string): Message[] => {
     const normChar = normalize(charName);
 
     // 2. Check for common User aliases
-    if (['you', 'user', 'me', 'player', 'anonymous'].includes(normName)) {
+    if (['you', 'user', 'me', 'player', 'anonymous', 'anda', 'saya'].includes(normName)) {
         roleMap[name] = 'user';
         return 'user';
     }

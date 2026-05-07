@@ -5,6 +5,7 @@ import { Character, LorebookEntry, AppSettings } from '../types';
 import { loadCharacters } from '../utils/storage';
 import { parseTavernCharacter, extractMetadataFromPNG } from '../utils/parsers';
 import { translateLorebookKeys } from '../services/geminiService';
+import ConfirmModal from '../components/ConfirmModal';
 
 interface Props {
   onSave: (chars: Character[]) => Promise<void>;
@@ -27,6 +28,9 @@ const CharacterCreator: React.FC<Props> = ({ onSave, settings }) => {
   
   // World Info State
   const [lorebook, setLorebook] = useState<LorebookEntry[]>([]);
+  
+  // Modals state
+  const [showTranslateConfirm, setShowTranslateConfirm] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -165,8 +169,11 @@ const CharacterCreator: React.FC<Props> = ({ onSave, settings }) => {
 
   const handleAutoTranslateLorebook = async () => {
       if (lorebook.length === 0) return;
-      if (!confirm("AI akan menerjemahkan/menambahkan sinonim Bahasa Indonesia untuk semua Keys Lorebook. Proses ini menggunakan API Key Anda. Lanjutkan?")) return;
+      setShowTranslateConfirm(true);
+  };
 
+  const confirmAutoTranslateLorebook = async () => {
+      setShowTranslateConfirm(false);
       setIsTranslating(true);
       try {
           const updated = await translateLorebookKeys(lorebook, settings);
@@ -181,6 +188,14 @@ const CharacterCreator: React.FC<Props> = ({ onSave, settings }) => {
 
   return (
     <div className="h-full overflow-y-auto p-6 md:p-12 max-w-4xl mx-auto custom-scrollbar">
+      <ConfirmModal
+          isOpen={showTranslateConfirm}
+          title="Terjemahkan Keys Lorebook"
+          message="AI akan menerjemahkan/menambahkan sinonim Bahasa Indonesia untuk semua Keys Lorebook. Proses ini menggunakan API Key Anda. Lanjutkan?"
+          onConfirm={confirmAutoTranslateLorebook}
+          onCancel={() => setShowTranslateConfirm(false)}
+          isDestructive={false}
+      />
       <div className="flex gap-4 mb-8 border-b border-gray-800 pb-4 sticky top-0 bg-[#0f0f12] z-10 pt-2">
         <button 
             onClick={() => setMode('create')}
@@ -213,7 +228,7 @@ const CharacterCreator: React.FC<Props> = ({ onSave, settings }) => {
                     </p>
                     
                     <label className="bg-primary-600 hover:bg-primary-500 text-white px-8 py-4 rounded-xl cursor-pointer transition shadow-lg shadow-primary-500/20 font-bold flex items-center gap-3">
-                        <input type="file" accept=".png,.json,.jsonl" onChange={handleFileImport} className="hidden" />
+                        <input type="file" accept=".png,.json,.jsonl,application/json,image/png,*/*" onChange={handleFileImport} className="hidden" />
                         <i className="fas fa-upload"></i> Pilih File
                     </label>
                 </>

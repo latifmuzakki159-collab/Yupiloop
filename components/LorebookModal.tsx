@@ -52,8 +52,8 @@ const LorebookModal: React.FC<Props> = ({ isOpen, onClose, lorebook, onSave, set
   const handleUpdate = (id: string, field: keyof LorebookEntry, value: any) => {
       setEntries(entries.map(e => {
           if (e.id === id) {
-              if (field === 'keys' && typeof value === 'string') {
-                  return { ...e, keys: value.split(',').map(k => k.trim()) };
+              if ((field === 'keys' || field === 'secondaryKeys') && typeof value === 'string') {
+                  return { ...e, [field]: value.split(',').map(k => k.trim()).filter(k => k) };
               }
               return { ...e, [field]: value };
           }
@@ -71,12 +71,26 @@ const LorebookModal: React.FC<Props> = ({ isOpen, onClose, lorebook, onSave, set
           const importedEntries = parseLorebook(json);
 
           if (importedEntries.length > 0) {
+              const wantsTranslate = confirm(`Berhasil mengimpor ${importedEntries.length} entri!\n\nApakah Anda ingin AI otomatis menerjemahkan kata kunci (keywords) ke Bahasa Indonesia agar lebih mudah terdeteksi saat chat? (Disarankan jika lorebook berbahasa Inggris)`);
+              
+              let finalEntries = importedEntries;
+              if (wantsTranslate) {
+                  setIsTranslating(true);
+                  try {
+                      finalEntries = await translateLorebookKeys(importedEntries, settings);
+                      alert("Terjemahan kata kunci berhasil!");
+                  } catch (err: any) {
+                      alert(`Gagal menerjemahkan: ${err.message}. Menggunakan kata kunci asli.`);
+                  } finally {
+                      setIsTranslating(false);
+                  }
+              }
+
               // Append imported entries to existing ones
-              const newEntries = [...entries, ...importedEntries];
+              const newEntries = [...entries, ...finalEntries];
               setEntries(newEntries);
               // Select the first new entry
-              setSelectedId(importedEntries[0].id);
-              alert(`Berhasil mengimpor ${importedEntries.length} entri!`);
+              setSelectedId(finalEntries[0].id);
           } else {
               alert('File valid, tetapi tidak ditemukan entri lorebook.');
           }
@@ -152,7 +166,7 @@ const LorebookModal: React.FC<Props> = ({ isOpen, onClose, lorebook, onSave, set
                     <button onClick={() => fileInputRef.current?.click()} className="flex-1 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg flex items-center justify-center gap-2 text-sm transition border border-gray-700" title="Impor JSON">
                         <i className="fas fa-file-import"></i> Impor
                     </button>
-                    <input type="file" ref={fileInputRef} onChange={handleImport} accept=".json" className="hidden" />
+                    <input type="file" ref={fileInputRef} onChange={handleImport} accept=".json,application/json,text/plain,*/*" className="hidden" />
                 </div>
                 
                 {/* Tools Section */}
@@ -192,12 +206,18 @@ const LorebookModal: React.FC<Props> = ({ isOpen, onClose, lorebook, onSave, set
                 {selectedEntry ? (
                     <div className="space-y-6 animate-fade-in">
                         <div className="flex justify-between items-start">
-                             <div>
+                             <div className="flex gap-4">
                                  <label className="flex items-center gap-2 cursor-pointer select-none">
                                      <div className={`w-10 h-6 rounded-full p-1 transition-colors duration-300 ${selectedEntry.enabled ? 'bg-green-600' : 'bg-gray-700'}`} onClick={() => handleUpdate(selectedEntry.id, 'enabled', !selectedEntry.enabled)}>
                                          <div className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-300 ${selectedEntry.enabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
                                      </div>
                                      <span className="text-sm text-gray-300 font-bold">{selectedEntry.enabled ? 'Aktif' : 'Nonaktif'}</span>
+                                 </label>
+                                 <label className="flex items-center gap-2 cursor-pointer select-none" title="Jika aktif, lore ini akan selalu disuntikkan ke AI tanpa perlu memicu kata kunci.">
+                                     <div className={`w-10 h-6 rounded-full p-1 transition-colors duration-300 ${selectedEntry.alwaysOn ? 'bg-blue-600' : 'bg-gray-700'}`} onClick={() => handleUpdate(selectedEntry.id, 'alwaysOn', !selectedEntry.alwaysOn)}>
+                                         <div className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-300 ${selectedEntry.alwaysOn ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                     </div>
+                                     <span className="text-sm text-gray-300 font-bold">{selectedEntry.alwaysOn ? 'Selalu Disuntikkan (Always On)' : 'Gunakan Kata Kunci'}</span>
                                  </label>
                              </div>
                              <button onClick={() => handleDelete(selectedEntry.id)} className="text-red-400 hover:text-red-300 text-sm flex items-center gap-1 hover:bg-red-900/20 px-3 py-1 rounded transition">
@@ -205,19 +225,36 @@ const LorebookModal: React.FC<Props> = ({ isOpen, onClose, lorebook, onSave, set
                              </button>
                         </div>
 
-                        <div className="space-y-2">
-                            <label className="block text-sm font-bold text-gray-300">
-                                Kata Kunci (Pemicu)
-                                <span className="block text-xs font-normal text-gray-500 mt-1">Pisahkan dengan koma. Lore ini akan disuntikkan jika salah satu kata ini muncul di chat.</span>
-                            </label>
-                            <input 
-                                type="text" 
-                                value={selectedEntry.keys.join(', ')} 
-                                onChange={(e) => handleUpdate(selectedEntry.id, 'keys', e.target.value)}
-                                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-white focus:ring-2 focus:ring-primary-500 outline-none font-mono text-sm"
-                                placeholder="contoh: kerajaan, raja arthur, excalibur"
-                            />
-                        </div>
+                        {!selectedEntry.alwaysOn && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-bold text-gray-300">
+                                        Kata Kunci Utama
+                                        <span className="block text-xs font-normal text-gray-500 mt-1">Pisahkan dengan koma. (Misal: Kingdom, Sword)</span>
+                                    </label>
+                                    <input 
+                                        type="text" 
+                                        value={selectedEntry.keys.join(', ')} 
+                                        onChange={(e) => handleUpdate(selectedEntry.id, 'keys', e.target.value)}
+                                        className="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-white focus:ring-2 focus:ring-primary-500 outline-none font-mono text-sm"
+                                        placeholder="contoh: kingdom, sword"
+                                    />
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="block text-sm font-bold text-gray-300">
+                                        Sinonim / Terjemahan
+                                        <span className="block text-xs font-normal text-gray-500 mt-1">Pisahkan dengan koma. (Misal: Kerajaan, Pedang)</span>
+                                    </label>
+                                    <input 
+                                        type="text" 
+                                        value={(selectedEntry.secondaryKeys || []).join(', ')} 
+                                        onChange={(e) => handleUpdate(selectedEntry.id, 'secondaryKeys', e.target.value)}
+                                        className="w-full bg-gray-900 border border-gray-700 rounded-lg p-3 text-white focus:ring-2 focus:ring-primary-500 outline-none font-mono text-sm"
+                                        placeholder="contoh: kerajaan, pedang"
+                                    />
+                                </div>
+                            </div>
+                        )}
 
                         <div className="space-y-2">
                             <label className="block text-sm font-bold text-gray-300">
